@@ -625,13 +625,14 @@ class ModlistTranslationInstallerApp:
             anchor="w",
             font=ctk.CTkFont(family="Segoe UI", size=12),
         ).grid(row=2, column=0, sticky="w", padx=(18, 8))
-        ctk.CTkLabel(
+        self.eta_label = ctk.CTkLabel(
             actions,
             textvariable=self.eta_text,
-            text_color=self.colors["muted"],
+            text_color=self.colors["warning"],
             anchor="e",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-        ).grid(row=2, column=1, sticky="e", padx=(8, 18))
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+        )
+        self.eta_label.grid(row=2, column=1, sticky="e", padx=(8, 18))
         self.download_button = ctk.CTkButton(
             actions,
             text="Çevirileri indir",
@@ -1760,6 +1761,7 @@ class ModlistTranslationInstallerApp:
         except (OSError, ValueError, json.JSONDecodeError):
             payload = {}
         converter_stage = str(payload.get("converter_stage") or payload.get("stage") or "")
+        runtime_stage = str(payload.get("stage") or "")
         total = int(payload.get("total_archives") or 0)
         processed = int(payload.get("processed_archives") or 0)
         if total > 0:
@@ -1771,6 +1773,15 @@ class ModlistTranslationInstallerApp:
                 total=total,
                 label=label,
                 visual_completed=display_processed,
+            )
+        elif runtime_stage in {
+            "applying_add_on_packages",
+            "writing_result",
+        } or payload.get("ok") is True:
+            self.eta_text.set(format_eta(0))
+            self._set_progress(
+                max(int(self.progress_value.get()), 98),
+                "Son kontroller yapılıyor",
             )
         elif converter_stage:
             self.eta_text.set(format_eta(None))
@@ -1803,7 +1814,8 @@ class ModlistTranslationInstallerApp:
         )
         ratio = min(progress_completed / self._eta_total, 1.0)
         value = self._eta_progress_base + int(self._eta_progress_span * ratio)
-        self._set_progress(min(98, value), label)
+        stable_value = max(int(self.progress_value.get()), min(98, value))
+        self._set_progress(stable_value, label)
 
     def _start_busy_progress(self, label: str) -> None:
         self._stop_busy_progress()
@@ -1826,6 +1838,9 @@ class ModlistTranslationInstallerApp:
     def _busy_progress_tick(self) -> None:
         if not self.busy:
             self._busy_progress_after = None
+            return
+        if self._eta_phase is not None:
+            self._busy_progress_after = self.root.after(700, self._busy_progress_tick)
             return
         current = int(self.progress_value.get())
         if current < self._busy_progress_cap:
