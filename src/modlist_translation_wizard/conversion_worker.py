@@ -43,7 +43,7 @@ def run_conversion_in_worker(
     config_path = worker_dir / "request.json"
     status_path = worker_dir / "status.json"
     result_path = output_dir / "wizard_conversion_result.json"
-    for path in (status_path,):
+    for path in (status_path, result_path):
         path.unlink(missing_ok=True)
     payload = {
         "schema_version": "mtw-conversion-worker-request.v1",
@@ -65,6 +65,9 @@ def run_conversion_in_worker(
     completed = _run_hidden_worker(_worker_command(config_path))
     status = _read_status(status_path)
     if status.get("ok") is not True:
+        recovered = _load_completed_result_if_available(result_path)
+        if recovered is not None:
+            return recovered
         error = str(status.get("error") or "").strip()
         error_type = str(status.get("error_type") or "WorkerFailed")
         details = f"{error_type}: {error}" if error else error_type
@@ -236,10 +239,30 @@ def _read_status(path: Path) -> dict[str, Any]:
 
 
 def _write_status(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(
+    _write_json_atomic(path, payload)
+
+
+def _load_completed_result_if_available(path: Path) -> WizardConversionResult | None:
+    if not path.is_file() or path.stat().st_size <= 0:
+        return None
+    try:
+        result = load_wizard_conversion_result(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    status = str(result.result_payload.get("status") or "").upper()
+    if status in {"COMPLETED", "COMPLETED_WITH_FAILURES"}:
+        return result
+    return None
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    temp_path.replace(path)
 
 
 def _decode_output(value: bytes | str | None) -> str:

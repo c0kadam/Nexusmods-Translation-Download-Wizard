@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import shutil
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -436,10 +437,7 @@ def convert_downloaded_translations_from_manifest(
     }
     _write_conversion_progress(progress_status_path, "writing_result")
     result_path = output_dir / "wizard_conversion_result.json"
-    result_path.write_text(
-        json.dumps(result_payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    _write_json_atomic(result_path, result_payload)
     return WizardConversionResult(
         result_path=result_path,
         staging_root=stage_root,
@@ -454,22 +452,26 @@ def _write_conversion_progress(path: Path | str | None, stage: str) -> None:
     status_path = Path(path)
     try:
         status_path.parent.mkdir(parents=True, exist_ok=True)
-        status_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": "mtw-conversion-worker-status.v1",
-                    "ok": False,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "stage": stage,
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-            + "\n",
-            encoding="utf-8",
+        _write_json_atomic(
+            status_path,
+            {
+                "schema_version": "mtw-conversion-worker-status.v1",
+                "ok": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "stage": stage,
+            },
         )
     except OSError:
         pass
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
 
 
 def load_wizard_conversion_result(result_path: Path | str) -> WizardConversionResult:
