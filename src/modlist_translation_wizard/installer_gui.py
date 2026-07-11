@@ -1285,7 +1285,7 @@ class ModlistTranslationInstallerApp:
         self._reset_prepare_status_style()
         self._set_status("Çeviri hazırlanıyor.")
         self._set_progress(88, "Çeviri hazırlanıyor")
-        self._start_conversion_time_estimate(run_workspace / "runtime" / "conversion-worker" / "status.json")
+        self._start_conversion_time_estimate(run_workspace / "runtime" / "conversion-worker" / "progress.json")
         self._run_task("Çeviri hazırlanıyor", work, done)
 
     def _show_completion_popup(self, output_folder: Path) -> None:

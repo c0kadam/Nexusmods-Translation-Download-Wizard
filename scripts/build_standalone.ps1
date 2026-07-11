@@ -68,7 +68,12 @@ if (-not $SkipTests) {
 Invoke-Checked "python" @("-B", "-m", "nuitka", "--version")
 
 Remove-Item -LiteralPath $BuildRoot -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $FinalDir -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $FinalDir) {
+    Remove-Item -LiteralPath $FinalDir -Recurse -Force -ErrorAction Stop
+}
+if (Test-Path -LiteralPath $FinalDir) {
+    throw "OutputRoot could not be removed before build: $FinalDir"
+}
 New-Item -ItemType Directory -Path $BuildRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Split-Path -Parent $FinalDir) -Force | Out-Null
 
@@ -117,7 +122,8 @@ $nuitkaDist = $nuitkaDistCandidates | Where-Object { Test-Path -LiteralPath $_ -
 if (-not $nuitkaDist) {
     throw "Nuitka output not found under: $BuildRoot"
 }
-Copy-Item -LiteralPath $nuitkaDist -Destination $FinalDir -Recurse
+New-Item -ItemType Directory -Path $FinalDir -Force | Out-Null
+Copy-Item -Path (Join-Path $nuitkaDist "*") -Destination $FinalDir -Recurse -Force
 
 $releaseOut = Join-Path $FinalDir "release"
 $assetArgs = @(

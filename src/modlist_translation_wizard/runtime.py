@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import os
 import shutil
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -466,12 +465,10 @@ def _write_conversion_progress(path: Path | str | None, stage: str) -> None:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temp_path.write_text(
+    path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    temp_path.replace(path)
 
 
 def load_wizard_conversion_result(result_path: Path | str) -> WizardConversionResult:

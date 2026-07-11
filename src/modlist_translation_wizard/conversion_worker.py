@@ -42,8 +42,9 @@ def run_conversion_in_worker(
     worker_dir.mkdir(parents=True, exist_ok=True)
     config_path = worker_dir / "request.json"
     status_path = worker_dir / "status.json"
+    progress_path = worker_dir / "progress.json"
     result_path = output_dir / "wizard_conversion_result.json"
-    for path in (status_path, result_path):
+    for path in (status_path, progress_path, result_path):
         path.unlink(missing_ok=True)
     payload = {
         "schema_version": "mtw-conversion-worker-request.v1",
@@ -56,6 +57,7 @@ def run_conversion_in_worker(
         "output_mod_name_override": str(output_mod_name_override),
         "allow_profile_drift": bool(allow_profile_drift),
         "status_path": str(status_path),
+        "progress_status_path": str(progress_path),
     }
     config_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
@@ -78,7 +80,8 @@ def run_conversion_in_worker(
             "Ceviri hazirlama islemi ayri worker process icinde basarisiz oldu.\n"
             f"Cikis kodu: {completed.returncode}\n"
             f"Detay: {details}\n"
-            f"Worker durum dosyasi: {status_path}"
+            f"Worker durum dosyasi: {status_path}\n"
+            f"Ilerleme dosyasi: {progress_path}"
         )
     result_text = str(status.get("result_path") or result_path)
     return load_wizard_conversion_result(result_text)
@@ -87,6 +90,7 @@ def run_conversion_in_worker(
 def run_conversion_worker(config_path: Path | str) -> int:
     config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
     status_path = Path(str(config["status_path"]))
+    progress_status_path = Path(str(config.get("progress_status_path") or status_path))
     status_path.parent.mkdir(parents=True, exist_ok=True)
     _write_status(
         status_path,
@@ -118,7 +122,7 @@ def run_conversion_worker(config_path: Path | str) -> int:
             staging_root=Path(str(config["staging_root"])),
             output_mod_name_override=str(config["output_mod_name_override"]),
             allow_profile_drift=bool(config["allow_profile_drift"]),
-            progress_status_path=status_path,
+            progress_status_path=progress_status_path,
         )
     except BaseException as exc:  # noqa: BLE001 - child process boundary must report SystemExit too.
         _write_status(
@@ -257,12 +261,10 @@ def _load_completed_result_if_available(path: Path) -> WizardConversionResult | 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temp_path.write_text(
+    path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    temp_path.replace(path)
 
 
 def _decode_output(value: bytes | str | None) -> str:

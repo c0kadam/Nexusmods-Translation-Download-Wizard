@@ -54,6 +54,20 @@ def test_worker_accepts_success_status_after_abnormal_process_exit(tmp_path: Pat
         config_path = Path(args[-1])
         config = json.loads(config_path.read_text(encoding="utf-8"))
         status_path = Path(config["status_path"])
+        progress_path = Path(config["progress_status_path"])
+        assert progress_path != status_path
+        progress_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "mtw-conversion-worker-status.v1",
+                    "ok": False,
+                    "stage": "running_archive_conversion",
+                    "processed_archives": 1,
+                    "total_archives": 2,
+                }
+            ),
+            encoding="utf-8",
+        )
         status_path.write_text(
             json.dumps(
                 {
