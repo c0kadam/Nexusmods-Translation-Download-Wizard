@@ -1,0 +1,4 @@
+# Install the local runtime package first if it is not available from an index:
+# python -m pip install -e "..\Modlist Translate Tool"
+
+-e .[build]
