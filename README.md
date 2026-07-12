@@ -70,6 +70,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build_standalone.ps1 `
 <Modlist klasörü>\mods\<Modlist adı> - Turkce Ceviri
 ```
 
+## Mod Listesi Çeviri Paketi Hazırlama
+
+Bu aracı kendi mod listeniz için paketlemek istiyorsanız kısa başlangıç rehberi:
+[docs/creating-a-release.md](docs/creating-a-release.md)
+
 ## Notlar
 
 - MO2 profiliniz ve `modlist.txt` otomatik değiştirilmez.
