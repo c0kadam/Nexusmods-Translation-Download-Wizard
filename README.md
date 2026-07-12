@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="NexusMods Translation Download Wizard logo" width="140">
+</p>
+
 # NexusMods Translation Download Wizard
 
 Skyrim mod listeleri için hazırlanmış Türkçe çeviri kurulum aracıdır. Hazır
