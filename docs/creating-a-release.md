@@ -43,6 +43,174 @@ src/modlist_translation_wizard/resources/releases/<release-id>/
 Aşağıdaki örnek gerçek bir tam manifest değildir, sadece alanların nasıl
 yerleştiğini göstermek için kısaltılmıştır.
 
+### 1. Üst Bilgi
+
+Bu bölüm manifestin kimliğini, hedef dili ve release durumunu belirtir.
+`release_state` hazırlık aşamasında `DRAFT`, yayımlanacak paketlerde
+`STABLE` gibi tutulabilir.
+
+```json
+{
+  "schema_version": "mtt-wizard-manifest.v2",
+  "manifest_id": "example-list-tr-stable",
+  "release_state": "DRAFT",
+  "language": "tr",
+  "channel": "stable"
+}
+```
+
+### 2. Mod Listesi Bilgisi
+
+Bu bölüm aracın hangi mod listesi ve hangi profil için hazırlandığını gösterir.
+`profile_fingerprint_sha256` boş bırakılabilir, ancak dolu olduğunda araç profil
+uyumluluğunu daha net kontrol edebilir.
+
+```json
+{
+  "modlist": {
+    "id": "example-list",
+    "name": "Example List",
+    "version": "1.0.0",
+    "supported_profiles": ["Default"],
+    "profile_fingerprint_sha256": ""
+  }
+}
+```
+
+### 3. Çıktı Modu
+
+Bu bölüm çeviri paketinin MO2 `mods` klasörü altında hangi isimle
+oluşturulacağını belirtir. Araç profili otomatik aktif etmez; kullanıcıdan onay
+veya manuel işlem beklenir.
+
+```json
+{
+  "output": {
+    "mod_name": "Example List - Turkce Ceviri",
+    "install_mode": "STAGED_MO2_MOD",
+    "profile_activation_requires_confirmation": true
+  }
+}
+```
+
+### 4. Nexus İndirme Davranışı
+
+Son kullanıcı aracı Nexus üzerinde arama yapmaz. Buradaki ayarlar aracın sadece
+manifestte verilmiş `mod_id` ve `file_id` değerleriyle çalışacağını belirtir.
+API anahtarı manifest içine yazılmaz; kullanıcı arayüzünden alınır.
+
+```json
+{
+  "nexus": {
+    "discovery_enabled": false,
+    "request_scope": "KNOWN_MOD_AND_FILE_IDS_ONLY",
+    "authentication": {
+      "manual_api_key": "USER_PROVIDED",
+      "secret_storage": "OS_CREDENTIAL_STORE"
+    },
+    "delivery": {
+      "premium_api": "SUPPORTED",
+      "non_premium_nxm": "SUPPORTED"
+    }
+  }
+}
+```
+
+### 5. Özet Sayılar
+
+Bu alanlar kullanıcıya ve testlere genel kapsam bilgisi verir. Büyük manifestlerde
+gerçek değerlerle güncel tutulması önerilir.
+
+```json
+{
+  "summary": {
+    "target_count": 1,
+    "entry_count": 1,
+    "artifact_reference_count": 1,
+    "unique_download_count": 1
+  }
+}
+```
+
+### 6. Tek Bir Çeviri Hedefi
+
+`entries` içindeki her öğe bir hedefi temsil eder. Hedef bir plugin, interface
+dosyası, strings dosyası veya başka bir native dosya olabilir.
+
+`target` çevrilecek dosyayı, `base` mod listesindeki orijinal modu,
+`selection` seçilen çeviri kararını, `install` ise nasıl işleneceğini belirtir.
+
+```json
+{
+  "target_id": "target-example-plugin",
+  "target": {
+    "path": "ExamplePlugin.esp",
+    "normalized_path": "exampleplugin.esp",
+    "type": "PLUGIN"
+  },
+  "base": {
+    "name": "Example Mod",
+    "version": "1.0",
+    "nexus_mod_id": 1000,
+    "nexus_file_id": 2000
+  },
+  "selection": {
+    "status": "APPROVED",
+    "confidence": "VERIFIED_CURATED",
+    "translation_name": "Example Mod Turkish Translation"
+  },
+  "install": {
+    "mode": "DSD_CONVERT"
+  }
+}
+```
+
+### 7. İndirilecek Çeviri Dosyası
+
+`artifacts` bölümü hedef için indirilecek NexusMods dosyasını tanımlar.
+Buradaki `translation_nexus_mod_id` ve `translation_file_id` değerleri doğruysa
+araç canlı arama yapmadan dosyayı indirebilir.
+
+```json
+{
+  "artifact_id": "nexusmods:skyrimspecialedition:3000:4000",
+  "source": "CURATED",
+  "game_domain": "skyrimspecialedition",
+  "translation_nexus_mod_id": 3000,
+  "translation_file_id": 4000,
+  "translation_file_name": "Example Mod Turkish Translation.zip",
+  "install_mode": "DSD_CONVERT",
+  "source_url": "https://www.nexusmods.com/skyrimspecialedition/mods/3000?tab=files&file_id=4000"
+}
+```
+
+### 8. Ek Paket
+
+`add_on_packages` opsiyoneldir. Mod listesi için hazırlanmış tamamlayıcı bir
+paket varsa burada tanımlanabilir. `OUTPUT_MOD_OVERLAY`, paketin çeviri çıktısının
+üzerine uygulanacağını belirtir.
+
+```json
+{
+  "id": "example-extra-pack",
+  "name": "Example List Turkce Ek Paketi",
+  "enabled": true,
+  "required": false,
+  "game_domain": "skyrimspecialedition",
+  "translation_nexus_mod_id": 5000,
+  "translation_file_id": 6000,
+  "translation_file_name": "Example List - Turkce Ek Paketi.zip",
+  "install_mode": "OUTPUT_MOD_OVERLAY",
+  "apply_order": 100000,
+  "source_url": "https://www.nexusmods.com/skyrimspecialedition/mods/5000?tab=files&file_id=6000"
+}
+```
+
+### Toplu Minimal Örnek
+
+Yukarıdaki parçalar birleştirildiğinde minimal manifest iskeleti şu yapıya
+yaklaşır:
+
 ```json
 {
   "schema_version": "mtt-wizard-manifest.v2",
@@ -175,4 +343,3 @@ dist\standalone.zip
   ve kullanıcı onaylı yapılmalıdır.
 - Script dosyaları sürüm hassas olabilir. Sadece uyumlu olduğundan emin olunan
   script çevirilerini dahil edin.
-
