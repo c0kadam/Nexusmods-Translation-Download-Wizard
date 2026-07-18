@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 from math import ceil
 from pathlib import Path
@@ -27,6 +28,9 @@ class ReleaseBranding:
     display_name: str
     subtitle: str
     accent_color: str
+    font_color: str = "#FFFFFF"
+    font_shadow: str = "#28150C"
+    warm_glow: str = "#8A5030"
     banner: str | None = None
     icon: str | None = None
 
@@ -92,6 +96,7 @@ def manifest_summary(manifest: dict[str, Any]) -> dict[str, str]:
         "language": str(manifest.get("language") or ""),
         "channel": str(manifest.get("channel") or ""),
         "release_state": str(manifest.get("release_state") or ""),
+        "manifest_updated_at": _manifest_updated_at_display(manifest),
         "entry_count": str(summary.get("entry_count") or 0),
         "unique_download_count": str(unique_download_count),
         "base_download_count": str(summary.get("unique_download_count") or 0),
@@ -99,6 +104,19 @@ def manifest_summary(manifest: dict[str, Any]) -> dict[str, str]:
         "output_mod_name": str(output.get("mod_name") or ""),
         "registered_app_id": app_id,
     }
+
+
+def _manifest_updated_at_display(manifest: dict[str, Any]) -> str:
+    value = str(manifest.get("updated_at") or manifest.get("created_at") or "").strip()
+    if not value:
+        return "bilinmiyor"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def load_release_branding(manifest: dict[str, Any]) -> ReleaseBranding:
@@ -145,10 +163,20 @@ def _release_branding_from_json(
     return ReleaseBranding(
         display_name=str(payload.get("display_name") or fallback_name),
         subtitle=str(payload.get("subtitle") or fallback_subtitle),
-        accent_color=str(payload.get("accent_color") or "#7c8f67"),
+        accent_color=_branding_color(payload.get("accent_color"), "#7C8F67"),
+        font_color=_branding_color(payload.get("font_color"), "#FFFFFF"),
+        font_shadow=_branding_color(payload.get("font_shadow"), "#28150C"),
+        warm_glow=_branding_color(payload.get("warm_glow"), "#8A5030"),
         banner=banner,
         icon=icon,
     )
+
+
+def _branding_color(value: object, fallback: str) -> str:
+    color = str(value or "").strip()
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+        return color.upper()
+    return fallback
 
 
 def release_branding_asset_bytes(
@@ -223,9 +251,18 @@ def api_settings_url() -> str:
     return NEXUS_API_KEYS_URL
 
 
+def api_key_notice(*, has_api_key: bool, delivery_mode: str) -> tuple[str, str]:
+    if has_api_key:
+        return "API anahtarı hazır.", "success"
+    if delivery_mode == "PREMIUM_API":
+        return "Premium indirme için Nexus API anahtarı gerekli.", "warning"
+    return "Ücretsiz / Tarayıcı indirmesinde API anahtarı gerekmez.", "muted"
+
+
 def visible_auth_controls() -> dict[str, bool]:
     return {
         "api_key": True,
+        "api_key_clear": True,
         "api_key_settings_link": True,
         "sso": False,
         "registered_app_id": False,
@@ -304,7 +341,7 @@ def installer_button_state(
             prepare_hint="Tüm gerekli arşivler hazır olmadan başlatılamaz.",
             staging_only=not real_install_supported,
         )
-    if not has_api_key:
+    if not has_api_key and delivery_mode == "PREMIUM_API":
         return InstallerButtonState(
             can_download=False,
             can_prepare=False,
@@ -394,7 +431,7 @@ def primary_action_label(
         return "Tamamlandı"
     if downloads_complete:
         return "Çeviriyi hazırla"
-    if not has_api_key:
+    if not has_api_key and delivery_mode == "PREMIUM_API":
         return "API Gerekli"
     if has_download_plan:
         if delivery_mode == "NON_PREMIUM_NXM":

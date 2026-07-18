@@ -1,6 +1,6 @@
 [project]
 name = "modlist-translation-wizard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Curated translation installer for supported Skyrim modlists."
 readme = "README.md"
 license = { file = "LICENSE" }

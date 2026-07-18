@@ -47,6 +47,8 @@ Assert-UnderProject $FinalDir "OutputRoot"
 $manifest = Join-Path $ReleaseSource "manifest.json"
 $branding = Join-Path $ReleaseSource "branding.json"
 $icon = Join-Path $ReleaseSource "icon.ico"
+$remoteConfig = Join-Path $ReleaseSource "remote_manifest.json"
+$releaseId = Split-Path -Leaf $ReleaseSource
 if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
     throw "Release manifest not found: $manifest"
 }
@@ -54,6 +56,11 @@ if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
 $env:PYTHONPATH = "$ProjectRoot\src;$RepoRoot\Modlist Translate Tool\src"
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = "1"
 $env:NUITKA_CACHE_DIR = $NuitkaCacheRoot
+$AppVersion = (& python -B -c "from modlist_translation_wizard.version import __version__; print(__version__)").Trim()
+if ($LASTEXITCODE -ne 0 -or $AppVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Could not determine a valid application version."
+}
+$FileVersion = "$AppVersion.0"
 
 if (-not $SkipTests) {
     Push-Location $ProjectRoot
@@ -104,8 +111,8 @@ if ($WindowsResources) {
         "--company-name=c0kadam",
         "--product-name=Ceviri Araci",
         "--file-description=Ceviri Araci",
-        "--product-version=0.1.0",
-        "--file-version=0.1.0.0"
+        ("--product-version={0}" -f $AppVersion),
+        ("--file-version={0}" -f $FileVersion)
     )
 }
 if ($AssumeYesForDownloads) {
@@ -132,7 +139,9 @@ $assetArgs = @(
     "--manifest",
     $manifest,
     "--out",
-    $releaseOut
+    $releaseOut,
+    "--expected-list-id",
+    $releaseId
 )
 if (Test-Path -LiteralPath $branding -PathType Leaf) {
     $assetArgs += @("--branding", $branding)
@@ -140,7 +149,26 @@ if (Test-Path -LiteralPath $branding -PathType Leaf) {
 if (Test-Path -LiteralPath $icon -PathType Leaf) {
     $assetArgs += @("--icon", $icon)
 }
+if (Test-Path -LiteralPath $remoteConfig -PathType Leaf) {
+    $assetArgs += @("--remote-config", $remoteConfig)
+}
 Invoke-Checked "python" $assetArgs
+
+$packageResourcesOut = Join-Path $FinalDir "modlist_translation_wizard\resources"
+New-Item -ItemType Directory -Path $packageResourcesOut -Force | Out-Null
+$packageResourcesFull = [System.IO.Path]::GetFullPath($packageResourcesOut).TrimEnd('\') + '\'
+foreach ($resourceTreeName in @("releases", "manifests", "branding")) {
+    $resourceTree = Join-Path $packageResourcesOut $resourceTreeName
+    $resourceTreeFull = [System.IO.Path]::GetFullPath($resourceTree)
+    if (-not $resourceTreeFull.StartsWith($packageResourcesFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Embedded resource cleanup escaped package resources: $resourceTreeFull"
+    }
+    Remove-Item -LiteralPath $resourceTree -Recurse -Force -ErrorAction SilentlyContinue
+}
+Copy-Item -LiteralPath (Join-Path $releaseOut "release_config.json") -Destination (Join-Path $packageResourcesOut "release_config.json") -Force
+if (Test-Path -LiteralPath (Join-Path $releaseOut "remote_manifest.json") -PathType Leaf) {
+    Copy-Item -LiteralPath (Join-Path $releaseOut "remote_manifest.json") -Destination (Join-Path $packageResourcesOut "remote_manifest.json") -Force
+}
 
 $releaseDocs = @("README.md", "LICENSE", "SECURITY.md", "AUTHORS.md")
 foreach ($docName in $releaseDocs) {

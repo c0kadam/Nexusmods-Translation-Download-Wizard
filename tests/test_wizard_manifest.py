@@ -7,6 +7,7 @@ import pytest
 
 from modlist_translation_wizard.archive_conversion import WizardArchiveConversionRunResult
 from modlist_translation_wizard.bundled import (
+    MANIFEST_MODE_LOCAL,
     copy_default_bundled_manifest,
     load_bundled_manifest,
     load_default_bundled_manifest,
@@ -32,6 +33,7 @@ def test_stable_manifest_exports_only_complete_approved_candidates() -> None:
     assert payload["schema_version"] == "mtt-wizard-manifest.v2"
     assert payload["nexus"]["discovery_enabled"] is False
     assert payload["nexus"]["request_scope"] == "KNOWN_MOD_AND_FILE_IDS_ONLY"
+    assert "manual_api_key" not in payload["nexus"]["authentication"]
     assert payload["summary"]["entry_count"] == 1
     assert payload["summary"]["artifact_reference_count"] == 2
     assert payload["summary"]["unique_download_count"] == 2
@@ -44,24 +46,30 @@ def test_stable_manifest_exports_only_complete_approved_candidates() -> None:
     assert all("key=" not in item["source_url"] for item in entry["artifacts"])
 
 
-def test_bundled_manifest_is_valid_and_discovery_free() -> None:
+def test_bundled_manifest_is_valid_and_discovery_free(monkeypatch) -> None:
+    monkeypatch.setenv("MTW_DISABLE_REMOTE_MANIFEST", "1")
     payload = load_bundled_manifest(
         list_id="lorerim",
         manifest_name="manifest.json",
     )
-    default_payload = load_default_bundled_manifest()
+    default_payload = load_default_bundled_manifest(manifest_mode=MANIFEST_MODE_LOCAL)
 
     assert payload["manifest_id"] == "lorerim-tr-stable"
     assert default_payload["manifest_id"] == payload["manifest_id"]
     assert payload["release_state"] == "DRAFT"
     assert payload["nexus"]["discovery_enabled"] is False
+    assert "manual_api_key" not in payload["nexus"]["authentication"]
     assert payload["schema_version"] == "mtt-wizard-manifest.v2"
     assert payload["output"]["mod_name"] == "LoreRim - Turkce Ceviri"
     assert payload["summary"]["entry_count"] > 0
 
 
-def test_default_bundled_manifest_can_be_copied_for_runtime(tmp_path) -> None:
-    copied = copy_default_bundled_manifest(tmp_path)
+def test_default_bundled_manifest_can_be_copied_for_runtime(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MTW_DISABLE_REMOTE_MANIFEST", "1")
+    copied = copy_default_bundled_manifest(
+        tmp_path,
+        manifest_mode=MANIFEST_MODE_LOCAL,
+    )
 
     assert copied.name == "manifest.json"
     assert copied.exists()
@@ -70,15 +78,47 @@ def test_default_bundled_manifest_can_be_copied_for_runtime(tmp_path) -> None:
 
 
 def test_default_manifest_can_load_external_release_dir(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("MTW_DISABLE_REMOTE_MANIFEST", "1")
     release_dir = tmp_path / "release"
     payload = _manifest()
     payload["manifest_id"] = "external-release-test"
     write_wizard_manifest(payload, release_dir / "manifest.json")
     monkeypatch.setenv("MTW_RELEASE_DIR", str(release_dir))
 
-    loaded = load_default_bundled_manifest()
+    loaded = load_default_bundled_manifest(manifest_mode=MANIFEST_MODE_LOCAL)
 
     assert loaded["manifest_id"] == "external-release-test"
+
+
+def test_default_manifest_uses_release_config_for_external_release_dir(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MTW_DISABLE_REMOTE_MANIFEST", "1")
+    monkeypatch.delenv("MTW_DEFAULT_RELEASE_ID", raising=False)
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    payload = _manifest()
+    payload["manifest_id"] = "nordicsouls-release-config-test"
+    payload["modlist"]["id"] = "nordicsouls"
+    payload["modlist"]["name"] = "NordicSouls"
+    write_wizard_manifest(payload, release_dir / "manifest.json")
+    (release_dir / "release_config.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "mtw-release-config.v1",
+                "release_id": "nordicsouls",
+                "manifest_name": "manifest.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MTW_RELEASE_DIR", str(release_dir))
+
+    loaded = load_default_bundled_manifest(manifest_mode=MANIFEST_MODE_LOCAL)
+
+    assert loaded["manifest_id"] == "nordicsouls-release-config-test"
+    assert loaded["modlist"]["id"] == "nordicsouls"
 
 
 def test_manifest_digest_is_required_and_verified(tmp_path) -> None:
@@ -140,6 +180,13 @@ def test_manifest_validation_requires_artifact_to_provide_target() -> None:
 def test_manifest_validation_accepts_add_on_packages() -> None:
     payload = _manifest()
     payload["add_on_packages"] = [_add_on_package()]
+
+    validate_wizard_manifest(payload)
+
+
+def test_manifest_validation_accepts_native_binary_install_entry() -> None:
+    payload = _manifest()
+    payload["entries"].append(_native_binary_entry(payload))
 
     validate_wizard_manifest(payload)
 
@@ -300,6 +347,36 @@ def test_premium_plan_appends_add_on_packages_last(tmp_path) -> None:
     readiness = download_queue_readiness(manifest, result.download_plan.queue_payload)
     assert readiness["required_count"] == 3
     assert readiness["missing_count"] == 3
+
+
+def test_premium_plan_appends_native_binary_assets_without_conversion_decision(
+    tmp_path,
+) -> None:
+    profile = _profile()
+    manifest = _manifest(profile=profile)
+    manifest["entries"].append(_native_binary_entry(manifest))
+    manifest_result = write_wizard_manifest(manifest, tmp_path / "wizard.json")
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    result = plan_premium_downloads_from_manifest(
+        manifest_path=manifest_result.manifest_path,
+        profile_scan_path=profile_path,
+        download_dir=tmp_path / "downloads",
+        out_dir=tmp_path / "out",
+    )
+
+    queue = result.download_plan.queue_payload
+    assert queue["summary"]["item_count"] == 3
+    assert queue["items"][-1]["request"]["translation_file_id"] == 695247
+    assert queue["items"][-1]["mtw_native_binary_assets"][0]["target_path"] == (
+        "SKSE/Plugins/Wheeler.dll"
+    )
+    decisions = json.loads(result.decisions_path.read_text(encoding="utf-8"))
+    assert all(
+        item.get("target_id") != "target-native-binary-wheeler"
+        for item in decisions["decisions"]
+    )
 
 
 def test_premium_plan_orders_decisions_by_manifest_conversion_order(tmp_path) -> None:
@@ -832,6 +909,174 @@ def test_conversion_overlays_add_on_package_after_converter(tmp_path, monkeypatc
     assert add_on_summary["extracted_file_count"] == 2
 
 
+def test_conversion_extracts_manifest_native_binary_asset_after_converter(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    profile = _profile()
+    binary_archive = tmp_path / "wheeler-dll.zip"
+    with zipfile.ZipFile(binary_archive, "w") as archive:
+        archive.writestr("SKSE/Plugins/Wheeler.dll", b"latin-extended-dll")
+        archive.writestr("Data/SKSE/Plugins/ignored.dll", b"ignored")
+    manifest = _manifest(profile=profile)
+    manifest["entries"].append(_native_binary_entry(manifest))
+    manifest_result = write_wizard_manifest(manifest, tmp_path / "wizard.json")
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    decisions_path = tmp_path / "decisions.json"
+    decisions_path.write_text('{"decisions":[]}', encoding="utf-8")
+    first_archive = tmp_path / "444.7z"
+    second_archive = tmp_path / "445.7z"
+    first_archive.write_bytes(b"archive-444")
+    second_archive.write_bytes(b"archive-445")
+    queue = _download_queue(
+        first_archive=first_archive,
+        second_archive=second_archive,
+    )
+    queue["items"].append(
+        {
+            "status": "READY",
+            "local_archive_path": str(binary_archive),
+            "request": {
+                "game_domain": "skyrimspecialedition",
+                "translation_nexus_mod_id": 166452,
+                "translation_file_id": 695247,
+            },
+        }
+    )
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(json.dumps(queue), encoding="utf-8")
+    staging_root = tmp_path / "selected-modlist" / "mods"
+
+    def fake_convert(**kwargs):
+        output_mod_path = Path(kwargs["output_root"]) / "LoreRim - Turkish DSD Output"
+        output_mod_path.mkdir(parents=True)
+        conversion_dir = Path(kwargs["out_dir"])
+        conversion_dir.mkdir(parents=True)
+        manifest_path = conversion_dir / "converter_manifest.json"
+        report_path = conversion_dir / "converter_report.md"
+        payload = {"summary": {"processed_archives": 2, "failed_items": 0}}
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        report_path.write_text("ok", encoding="utf-8")
+        return WizardArchiveConversionRunResult(
+            manifest_path=manifest_path,
+            report_path=report_path,
+            output_mod_path=output_mod_path,
+            manifest_payload=payload,
+        )
+
+    monkeypatch.setattr(
+        "modlist_translation_wizard.runtime.convert_downloaded_archives_to_mtw_dsd",
+        fake_convert,
+    )
+
+    result = convert_downloaded_translations_from_manifest(
+        manifest_path=manifest_result.manifest_path,
+        profile_scan_path=profile_path,
+        decisions_path=decisions_path,
+        download_queue_path=queue_path,
+        out_dir=tmp_path / "runtime",
+        staging_root=staging_root,
+    )
+
+    output_mod = result.conversion.output_mod_path
+    assert (output_mod / "SKSE" / "Plugins" / "Wheeler.dll").read_bytes() == (
+        b"latin-extended-dll"
+    )
+    assert not (output_mod / "SKSE" / "Plugins" / "ignored.dll").exists()
+    assert result.result_payload["status"] == "COMPLETED"
+    binary_summary = result.result_payload["native_binary_assets"]["summary"]
+    assert binary_summary["extracted"] == 1
+    managed_state = json.loads(
+        (output_mod / ".mtw" / "managed_native_binary_assets.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert managed_state["items"][0]["archive_member"] == "SKSE/Plugins/Wheeler.dll"
+
+
+def test_conversion_removes_stale_managed_native_binary_when_manifest_entry_is_removed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    profile = _profile()
+    manifest_result = write_wizard_manifest(
+        _manifest(profile=profile),
+        tmp_path / "wizard.json",
+    )
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    decisions_path = tmp_path / "decisions.json"
+    decisions_path.write_text('{"decisions":[]}', encoding="utf-8")
+    first_archive = tmp_path / "444.7z"
+    second_archive = tmp_path / "445.7z"
+    first_archive.write_bytes(b"archive-444")
+    second_archive.write_bytes(b"archive-445")
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _download_queue(
+                first_archive=first_archive,
+                second_archive=second_archive,
+            )
+        ),
+        encoding="utf-8",
+    )
+    staging_root = tmp_path / "selected-modlist" / "mods"
+
+    def fake_convert(**kwargs):
+        output_mod_path = Path(kwargs["output_root"]) / "LoreRim - Turkish DSD Output"
+        stale = output_mod_path / "SKSE" / "Plugins" / "Wheeler.dll"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"old-managed-dll")
+        state = output_mod_path / ".mtw" / "managed_native_binary_assets.json"
+        state.parent.mkdir(parents=True)
+        state.write_text(
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "target_path": "SKSE/Plugins/Wheeler.dll",
+                            "normalized_target_path": "skse/plugins/wheeler.dll",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        conversion_dir = Path(kwargs["out_dir"])
+        conversion_dir.mkdir(parents=True)
+        manifest_path = conversion_dir / "converter_manifest.json"
+        report_path = conversion_dir / "converter_report.md"
+        payload = {"summary": {"processed_archives": 2, "failed_items": 0}}
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        report_path.write_text("ok", encoding="utf-8")
+        return WizardArchiveConversionRunResult(
+            manifest_path=manifest_path,
+            report_path=report_path,
+            output_mod_path=output_mod_path,
+            manifest_payload=payload,
+        )
+
+    monkeypatch.setattr(
+        "modlist_translation_wizard.runtime.convert_downloaded_archives_to_mtw_dsd",
+        fake_convert,
+    )
+
+    result = convert_downloaded_translations_from_manifest(
+        manifest_path=manifest_result.manifest_path,
+        profile_scan_path=profile_path,
+        decisions_path=decisions_path,
+        download_queue_path=queue_path,
+        out_dir=tmp_path / "runtime",
+        staging_root=staging_root,
+    )
+
+    stale = result.conversion.output_mod_path / "SKSE" / "Plugins" / "Wheeler.dll"
+    assert not stale.exists()
+    assert result.result_payload["native_binary_assets"]["summary"]["cleanup_removed"] == 1
+
+
 def test_conversion_uses_requested_output_mod_name_override(tmp_path, monkeypatch) -> None:
     profile = _profile()
     manifest_result = write_wizard_manifest(
@@ -1034,6 +1279,58 @@ def _add_on_package(
             "https://www.nexusmods.com/skyrimspecialedition/mods/158770"
             "?tab=files&file_id=773329"
         ),
+    }
+
+
+def _native_binary_entry(manifest: dict) -> dict:
+    base_entry = manifest["entries"][0]
+    artifact = base_entry["artifacts"][0]
+    return {
+        "target_id": "target-native-binary-wheeler",
+        "target": {
+            "path": "SKSE/Plugins/Wheeler.dll",
+            "normalized_path": "skse/plugins/wheeler.dll",
+            "type": "NATIVE_BINARY",
+        },
+        "base": dict(base_entry["base"]),
+        "selection": {
+            "status": "APPROVED",
+            "confidence": "VERIFIED_METADATA",
+            "translation_name": "Wheeler Turkish Latin Extended DLL",
+            "score": 100,
+            "provenance": ["MTT_BINARY_ASSET_CATALOG"],
+            "reasons": ["binary_asset_catalog"],
+            "warnings": [],
+        },
+        "install": {"mode": "NATIVE_BINARY_INSTALL"},
+        "artifacts": [
+            {
+                **artifact,
+                "artifact_id": "nexusmods:skyrimspecialedition:166452:695247",
+                "source": "MTT_BINARY_ASSET_CATALOG",
+                "game_domain": "skyrimspecialedition",
+                "translation_nexus_mod_id": 166452,
+                "translation_file_id": 695247,
+                "translation_name": "Wheeler Turkish Latin Extended DLL",
+                "translation_file_name": "wheeler-dll.zip",
+                "required": True,
+                "provides": ["SKSE/Plugins/Wheeler.dll"],
+                "evidence": ["binary_asset_catalog"],
+                "install_mode": "NATIVE_BINARY_INSTALL",
+                "archive_member": "Data/SKSE/Plugins/Wheeler.dll",
+                "archive_member_candidates": [
+                    "Data/SKSE/Plugins/Wheeler.dll",
+                    "SKSE/Plugins/Wheeler.dll",
+                ],
+                "managed": True,
+                "binary_asset_id": "wheeler-tr-latin-extended-dll",
+                "source_url": (
+                    "https://www.nexusmods.com/skyrimspecialedition/mods/166452"
+                    "?tab=files&file_id=695247"
+                ),
+            }
+        ],
+        "alternatives": [],
     }
 
 

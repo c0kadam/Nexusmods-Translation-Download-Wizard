@@ -11,6 +11,7 @@ import traceback
 import time
 import webbrowser
 from datetime import datetime, timezone
+from importlib.resources import files
 from io import BytesIO
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -23,7 +24,11 @@ from modlist_translate_tool.app.workflow import scan_profile
 from modlist_translate_tool.nexus.downloader import urllib_download_to_file
 
 from modlist_translation_wizard.bundled import (
-    copy_default_bundled_manifest,
+    MANIFEST_MODE_LOCAL,
+    MANIFEST_MODE_OTA,
+    clear_default_remote_manifest_cache,
+    default_manifest_source_info,
+    default_release_info,
     load_default_bundled_manifest,
 )
 from modlist_translation_wizard.conversion_worker import run_conversion_in_worker
@@ -36,6 +41,7 @@ from modlist_translation_wizard.credential_store import (
 from modlist_translation_wizard.gui_model import (
     NON_PREMIUM_DELIVERY_LABEL,
     PREMIUM_DELIVERY_LABEL,
+    api_key_notice,
     api_settings_url,
     delivery_mode_value,
     discover_mo2_profiles,
@@ -52,9 +58,11 @@ from modlist_translation_wizard.gui_model import (
 )
 from modlist_translation_wizard.nexus_auth import (
     api_key_status,
+    clear_api_key,
     load_api_key,
     store_manual_api_key,
 )
+from modlist_translation_wizard.manifest import write_wizard_manifest
 from modlist_translation_wizard.non_premium import (
     failed_non_premium_downloads,
     next_non_premium_download,
@@ -71,24 +79,51 @@ from modlist_translation_wizard.runtime import (
     plan_downloads_from_manifest,
     run_premium_downloads_from_plan,
 )
-from modlist_translation_wizard.version import __version__
 
 
 BANNER_IMAGE_MAX_WIDTH = 820
 BANNER_IMAGE_MAX_HEIGHT = 126
 BANNER_TEXT_COLUMN_WIDTH = 430
 BANNER_WINDOW_PADDING = 140
+
+
+def _banner_title_font_size(title: str) -> int:
+    length = len(title.strip())
+    if length <= 30:
+        return 24
+    if length <= 38:
+        return 21
+    if length <= 48:
+        return 18
+    return 16
 DEFAULT_WINDOW_HEIGHT = 760
 MIN_WINDOW_WIDTH = 1040
 MAX_WINDOW_WIDTH = 1500
+MANIFEST_MODE_OTA_LABEL = "OTA (Güncel)"
+MANIFEST_MODE_LOCAL_LABEL = "Yerel"
 
 
 class ModlistTranslationInstallerApp:
     """Single-release, discovery-free installer surface."""
 
-    def __init__(self, root: ctk.CTk) -> None:
+    def __init__(
+        self,
+        root: ctk.CTk,
+        *,
+        initial_manifest: dict[str, Any] | None = None,
+        initial_manifest_mode: str = MANIFEST_MODE_OTA,
+        initial_source_info: dict[str, str | None] | None = None,
+    ) -> None:
         self.root = root
-        self.manifest = load_default_bundled_manifest()
+        self.manifest_mode = tk.StringVar(value=initial_manifest_mode)
+        self.manifest = initial_manifest or load_default_bundled_manifest(
+            manifest_mode=self.manifest_mode.get()
+        )
+        self.manifest_source_info = (
+            dict(initial_source_info)
+            if initial_source_info is not None
+            else default_manifest_source_info()
+        )
         self.summary = manifest_summary(self.manifest)
         self.branding = load_release_branding(self.manifest)
         self.app_id = self.summary["registered_app_id"]
@@ -121,6 +156,9 @@ class ModlistTranslationInstallerApp:
         self.progress_percent = tk.StringVar(value="0%")
         self.progress_label = tk.StringVar(value="Başlamadı")
         self.eta_text = tk.StringVar(value="")
+        self.release_summary_text = tk.StringVar(value=self._release_summary_display())
+        source_text, _source_tone = self._manifest_source_notice()
+        self.manifest_source_text = tk.StringVar(value=source_text)
 
         self.profile_scan_path: Path | None = None
         self.preflight_payload: dict[str, Any] | None = None
@@ -147,6 +185,7 @@ class ModlistTranslationInstallerApp:
         self._eta_progress_span = 0
         self._eta_status_path: Path | None = None
         self.banner_image: ctk.CTkImage | None = None
+        self.discord_support_icon: ctk.CTkImage | None = None
         self.completion_popup: ctk.CTkToplevel | None = None
 
         try:
@@ -215,6 +254,7 @@ class ModlistTranslationInstallerApp:
         self._build_release_summary(shell)
         self._build_main_form(shell)
         self._log("Hazır.")
+        self._log_manifest_source()
 
     def _build_banner(self, parent: ctk.CTkFrame) -> None:
         banner = ctk.CTkFrame(
@@ -222,6 +262,8 @@ class ModlistTranslationInstallerApp:
             fg_color=self.colors["accent"],
             corner_radius=18,
             height=154,
+            border_width=1,
+            border_color=self.branding.warm_glow,
         )
         banner.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
         banner.grid_propagate(False)
@@ -231,16 +273,37 @@ class ModlistTranslationInstallerApp:
 
         text_frame = ctk.CTkFrame(banner, fg_color="transparent")
         text_frame.grid(row=0, column=0, sticky="w", padx=28, pady=24)
-        ctk.CTkLabel(
+        title_layer = ctk.CTkFrame(
             text_frame,
+            width=BANNER_TEXT_COLUMN_WIDTH - 56,
+            height=36,
+            fg_color="transparent",
+        )
+        title_layer.pack(anchor="w")
+        title_layer.pack_propagate(False)
+        title_font = ctk.CTkFont(
+            family="Segoe UI",
+            size=_banner_title_font_size(self.branding.display_name),
+            weight="bold",
+        )
+        ctk.CTkLabel(
+            title_layer,
             text=self.branding.display_name,
-            text_color="white",
-            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
-        ).pack(anchor="w")
+            text_color=self.branding.font_shadow,
+            font=title_font,
+            anchor="w",
+        ).place(x=2, y=2, relwidth=1, relheight=1)
+        ctk.CTkLabel(
+            title_layer,
+            text=self.branding.display_name,
+            text_color=self.branding.font_color,
+            font=title_font,
+            anchor="w",
+        ).place(x=0, y=0, relwidth=1, relheight=1)
         ctk.CTkLabel(
             text_frame,
             text=self.branding.subtitle,
-            text_color="#f6dfd1",
+            text_color=self.branding.font_color,
             font=ctk.CTkFont(family="Segoe UI", size=12),
         ).pack(anchor="w", pady=(4, 0))
         mode_row = ctk.CTkFrame(text_frame, fg_color="transparent")
@@ -248,18 +311,18 @@ class ModlistTranslationInstallerApp:
         ctk.CTkLabel(
             mode_row,
             text="Görünüm",
-            text_color="#f6dfd1",
+            text_color=self.branding.font_color,
             font=ctk.CTkFont(family="Segoe UI", size=11),
         ).pack(side=tk.LEFT, padx=(0, 8))
         self.appearance_mode = ctk.CTkSegmentedButton(
             mode_row,
             values=["Koyu", "Açık"],
             command=self._on_appearance_changed,
-            selected_color="#28150c",
-            selected_hover_color="#3a2114",
-            unselected_color="#8a5030",
-            unselected_hover_color="#9b5f3c",
-            text_color="white",
+            selected_color=self.branding.font_shadow,
+            selected_hover_color=self.branding.warm_glow,
+            unselected_color=self.branding.warm_glow,
+            unselected_hover_color=self.branding.accent_color,
+            text_color=self.branding.font_color,
             corner_radius=8,
             height=28,
         )
@@ -328,10 +391,97 @@ class ModlistTranslationInstallerApp:
             border_color=self.colors["line"],
         )
         card.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 10))
-        card.columnconfigure(0, weight=1)
+        card.columnconfigure(0, weight=3)
+        card.columnconfigure(1, weight=2, minsize=360)
+        ctk.CTkLabel(
+            card,
+            textvariable=self.release_summary_text,
+            text_color=self.colors["text"],
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+        ).grid(row=0, column=0, sticky="ew", padx=(18, 12), pady=(14, 8))
+
+        source_row = ctk.CTkFrame(card, fg_color="transparent")
+        source_row.grid(row=1, column=0, sticky="ew", padx=(18, 12), pady=(0, 14))
+        ctk.CTkLabel(
+            source_row,
+            text="Çeviri listesi",
+            text_color=self.colors["muted"],
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.manifest_mode_control = ctk.CTkSegmentedButton(
+            source_row,
+            values=[MANIFEST_MODE_OTA_LABEL, MANIFEST_MODE_LOCAL_LABEL],
+            command=self._on_manifest_mode_changed,
+            selected_color=self.colors["accent"],
+            selected_hover_color=self.colors["accent_hover"],
+            unselected_color=self.colors["button"],
+            unselected_hover_color=self.colors["button_hover"],
+            corner_radius=8,
+            height=30,
+        )
+        self.manifest_mode_control.grid(row=0, column=1, sticky="w")
+        self.manifest_mode_control.set(self._manifest_mode_label())
+
+        _source_text, source_tone = self._manifest_source_display()
+        self.manifest_source_frame = ctk.CTkFrame(
+            card,
+            fg_color=self.colors["panel_alt"],
+            corner_radius=10,
+            border_width=1,
+            border_color=self.colors[source_tone],
+        )
+        self.manifest_source_frame.grid(
+            row=0,
+            column=1,
+            rowspan=2,
+            sticky="nsew",
+            padx=(6, 14),
+            pady=12,
+        )
+        self.manifest_source_frame.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            self.manifest_source_frame,
+            text="Çeviri listesi durumu",
+            text_color=self.colors["muted"],
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=11),
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 2))
+        self.manifest_source_label = ctk.CTkLabel(
+            self.manifest_source_frame,
+            textvariable=self.manifest_source_text,
+            text_color=self.colors[source_tone],
+            anchor="w",
+            justify="left",
+            wraplength=410,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+        )
+        self.manifest_source_label.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+
+    def _log_manifest_source(self) -> None:
+        info = self.manifest_source_info
+        source = str(info.get("source") or "")
+        version = str(info.get("version") or "").strip()
+        warning = str(info.get("warning") or "").strip()
+        if source == "remote_download":
+            suffix = f" ({version})" if version else ""
+            self._log(f"Çeviri listesi güncellendi{suffix}.")
+        elif source == "remote_cache":
+            suffix = f" ({version})" if version else ""
+            self._log(f"Çeviri listesi önbellekten kullanıldı{suffix}.")
+        elif source == "external":
+            self._log("Çeviri listesi yerel release klasöründen yüklendi.")
+        elif source == "bundled":
+            self._log("Çeviri listesi uygulamadaki yerel paketten yüklendi.")
+        elif source == "remote_failed":
+            self._log("Çeviri listesi güncellemesi alınamadı; yerel liste kullanılacak.")
+        if warning:
+            self._log(f"Çeviri listesi uyarısı: {warning}")
+
+    def _release_summary_display(self) -> str:
         add_on_count = int(self.summary.get("add_on_package_count") or 0)
         add_on_text = f" / {add_on_count} ek paket" if add_on_count else ""
-        text = (
+        return (
             f"{self.summary['modlist_name']}  |  "
             f"{self.summary['modlist_version']}  |  "
             f"{self.summary['language'].upper()}  |  "
@@ -339,13 +489,112 @@ class ModlistTranslationInstallerApp:
             f"{self.summary['unique_download_count']} dosya"
             f"{add_on_text}"
         )
-        ctk.CTkLabel(
-            card,
-            text=text,
-            text_color=self.colors["text"],
-            anchor="w",
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-        ).grid(row=0, column=0, sticky="ew", padx=18, pady=12)
+
+    def _manifest_mode_label(self) -> str:
+        if self.manifest_mode.get() == MANIFEST_MODE_LOCAL:
+            return MANIFEST_MODE_LOCAL_LABEL
+        return MANIFEST_MODE_OTA_LABEL
+
+    def _manifest_source_display(self) -> tuple[str, str]:
+        info = self.manifest_source_info
+        source = str(info.get("source") or "")
+        version = str(info.get("version") or "").strip()
+        fallback = str(info.get("fallback_from") or "").upper() == MANIFEST_MODE_OTA
+        suffix = f" • {version}" if version else ""
+        if source == "remote_download":
+            return f"Aktif kaynak: OTA • GitHub'dan güncellendi{suffix}", "success"
+        if source == "remote_cache":
+            warning = str(info.get("warning") or "").strip()
+            if warning:
+                return f"Aktif kaynak: OTA önbelleği{suffix} • Ağ güncellemesi alınamadı", "warning"
+            return f"Aktif kaynak: OTA önbelleği{suffix}", "success"
+        if source == "external":
+            if fallback:
+                return "Aktif kaynak: Yerel release • OTA kullanılamadı", "warning"
+            return "Aktif kaynak: Yerel release", "muted"
+        if source == "bundled":
+            if fallback:
+                return "Aktif kaynak: Yerel paket • OTA kullanılamadı", "warning"
+            return "Aktif kaynak: Uygulamaya gömülü yerel paket", "muted"
+        return "Aktif manifest kaynağı belirlenemedi", "warning"
+
+    def _manifest_source_notice(self) -> tuple[str, str]:
+        source_text, tone = self._manifest_source_display()
+        updated_at = str(self.summary.get("manifest_updated_at") or "Bilinmiyor")
+        return f"{source_text}\nSon güncelleme: {updated_at}", tone
+
+    def _set_manifest_source_visual(self, text: str, tone: str) -> None:
+        self.manifest_source_text.set(text)
+        color = self.colors.get(tone, self.colors["warning"])
+        label = getattr(self, "manifest_source_label", None)
+        if label is not None:
+            label.configure(text_color=color)
+        frame = getattr(self, "manifest_source_frame", None)
+        if frame is not None:
+            frame.configure(border_color=color)
+
+    def _on_manifest_mode_changed(self, selected_label: str) -> None:
+        requested_mode = (
+            MANIFEST_MODE_LOCAL
+            if selected_label == MANIFEST_MODE_LOCAL_LABEL
+            else MANIFEST_MODE_OTA
+        )
+        previous_mode = self.manifest_mode.get()
+        if requested_mode == previous_mode:
+            return
+        if self.busy:
+            self.manifest_mode_control.set(self._manifest_mode_label())
+            messagebox.showinfo("İşlem sürüyor", "Manifest kaynağı işlem tamamlanınca değiştirilebilir.")
+            return
+
+        self.manifest_mode.set(requested_mode)
+        self._set_manifest_source_visual(
+            "Çeviri listesi kaynağı değiştiriliyor...",
+            "warning",
+        )
+
+        def work() -> dict[str, Any]:
+            try:
+                manifest = load_default_bundled_manifest(manifest_mode=requested_mode)
+                return {
+                    "manifest": manifest,
+                    "source_info": default_manifest_source_info(),
+                }
+            except Exception as exc:  # noqa: BLE001 - restored safely in GUI callback.
+                return {
+                    "error": exc,
+                    "traceback": traceback.format_exc(),
+                }
+
+        def done(result: dict[str, Any]) -> None:
+            error = result.get("error")
+            if isinstance(error, BaseException):
+                self.manifest_mode.set(previous_mode)
+                self.manifest_mode_control.set(self._manifest_mode_label())
+                source_text, source_tone = self._manifest_source_notice()
+                self._set_manifest_source_visual(source_text, source_tone)
+                self._handle_task_error(error, str(result.get("traceback") or ""))
+                return
+
+            self.manifest = result["manifest"]
+            self.manifest_source_info = dict(result["source_info"])
+            self.summary = manifest_summary(self.manifest)
+            self.app_id = self.summary["registered_app_id"]
+            self.release_summary_text.set(self._release_summary_display())
+            source_text, source_tone = self._manifest_source_notice()
+            self._set_manifest_source_visual(source_text, source_tone)
+            self._reset_for_profile_change()
+            self._log(
+                "Çeviri listesi kaynağı değiştirildi: "
+                + ("OTA" if requested_mode == MANIFEST_MODE_OTA else "Yerel")
+            )
+            self._log_manifest_source()
+            if self.mo2_root.get().strip():
+                self._find_profiles()
+            else:
+                self._refresh_pipeline_buttons()
+
+        self._run_task("Çeviri listesi yükleniyor", work, done)
 
     def _build_main_form(self, parent: ctk.CTkFrame) -> None:
         main = ctk.CTkFrame(
@@ -465,29 +714,57 @@ class ModlistTranslationInstallerApp:
             fg_color=self.colors["panel_alt"],
             border_color=self.colors["line"],
         ).grid(row=4, column=1, sticky="ew", pady=(12, 6))
+        api_actions = ctk.CTkFrame(main, fg_color="transparent")
+        api_actions.grid(
+            row=4,
+            column=2,
+            columnspan=2,
+            sticky="w",
+            padx=(10, 18),
+            pady=(12, 6),
+        )
         ctk.CTkButton(
-            main,
+            api_actions,
             text="Kaydet",
             command=self._save_api_key,
             corner_radius=8,
             fg_color=self.colors["button"],
             hover_color=self.colors["button_hover"],
-        ).grid(row=4, column=2, sticky="ew", padx=(10, 0), pady=(12, 6))
+            width=86,
+        ).pack(side=tk.LEFT)
         ctk.CTkButton(
-            main,
+            api_actions,
+            text="Sil",
+            command=self._clear_api_key,
+            corner_radius=8,
+            fg_color=self.colors["button"],
+            hover_color=("#fee2e2", "#4c1d1d"),
+            text_color=self.colors["danger"],
+            width=72,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ctk.CTkButton(
+            api_actions,
             text="API anahtarı sayfasını aç",
             command=self._open_api_key_page,
             corner_radius=8,
             fg_color=self.colors["button"],
             hover_color=self.colors["button_hover"],
-        ).grid(row=4, column=3, sticky="w", padx=(10, 18), pady=(12, 6))
-        ctk.CTkLabel(
+            width=190,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self.auth_status_label = ctk.CTkLabel(
             main,
             textvariable=self.auth_status_text,
             text_color=self.colors["muted"],
             font=ctk.CTkFont(family="Segoe UI", size=12),
             anchor="w",
-        ).grid(row=5, column=1, columnspan=3, sticky="w", pady=(0, 6))
+        )
+        self.auth_status_label.grid(
+            row=5,
+            column=1,
+            columnspan=3,
+            sticky="w",
+            pady=(0, 6),
+        )
 
         ctk.CTkLabel(
             main,
@@ -521,15 +798,24 @@ class ModlistTranslationInstallerApp:
             border_color=self.colors["free"],
             font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
         ).pack(side=tk.LEFT, padx=(0, 16))
-        support = ctk.CTkLabel(
+        self.discord_support_icon = self._load_discord_support_icon()
+        support = ctk.CTkButton(
             methods,
             text="Download Destek: c0kadam",
+            image=self.discord_support_icon,
+            command=self._open_discord_support,
+            compound="left",
             text_color=self.colors["link"],
             cursor="hand2",
             font=ctk.CTkFont(family="Segoe UI", size=13, underline=True),
+            fg_color="transparent",
+            hover_color=self.colors["panel_alt"],
+            corner_radius=7,
+            height=28,
+            width=232,
+            anchor="w",
         )
         support.pack(side=tk.LEFT)
-        support.bind("<Button-1>", lambda _event: self._open_discord_support())
 
         self.nxm_frame = ctk.CTkFrame(main, fg_color="transparent")
         self.nxm_frame.grid(row=7, column=0, columnspan=4, sticky="ew", padx=18, pady=(6, 16))
@@ -829,7 +1115,7 @@ class ModlistTranslationInstallerApp:
 
     def _save_api_key(self) -> None:
         try:
-            status = store_manual_api_key(
+            store_manual_api_key(
                 self.store,
                 app_id=self.app_id,
                 api_key=self.api_key.get(),
@@ -838,15 +1124,45 @@ class ModlistTranslationInstallerApp:
             messagebox.showerror("API kaydedilemedi", str(exc))
             return
         self.api_key.set("")
-        self.auth_status_text.set(f"API anahtarı kayıtlı: {status.mode}")
         self._log("Nexus API anahtarı kaydedildi.")
-        self._refresh_pipeline_buttons()
+        self._refresh_auth_status()
+
+    def _clear_api_key(self) -> None:
+        if not self._api_key():
+            self.api_key.set("")
+            self._refresh_auth_status()
+            return
+        confirmed = messagebox.askyesno(
+            "API anahtarını sil",
+            "Kaydedilmiş Nexus API anahtarı bu bilgisayardan silinsin mi?",
+        )
+        if not confirmed:
+            return
+        try:
+            clear_api_key(self.store, app_id=self.app_id)
+        except Exception as exc:  # noqa: BLE001 - GUI boundary reports sanitized text.
+            messagebox.showerror("API anahtarı silinemedi", str(exc))
+            return
+        self.api_key.set("")
+        self._log("Kaydedilmiş Nexus API anahtarı silindi.")
+        self._refresh_auth_status()
 
     def _open_api_key_page(self) -> None:
         webbrowser.open(api_settings_url(), new=2, autoraise=True)
 
     def _open_discord_support(self) -> None:
         webbrowser.open("https://discordapp.com/users/279006796524421130", new=2, autoraise=True)
+
+    @staticmethod
+    def _load_discord_support_icon() -> ctk.CTkImage | None:
+        try:
+            asset = files("modlist_translation_wizard").joinpath(
+                "resources", "assets", "discord-seeklogo.png"
+            )
+            image = Image.open(BytesIO(asset.read_bytes())).convert("RGBA")
+        except (FileNotFoundError, OSError, UnidentifiedImageError):
+            return None
+        return ctk.CTkImage(light_image=image, dark_image=image, size=(42, 21))
 
     def _on_appearance_changed(self, value: str) -> None:
         ctk.set_appearance_mode("light" if value == "Açık" else "dark")
@@ -872,10 +1188,18 @@ class ModlistTranslationInstallerApp:
             status = api_key_status(self.store, app_id=self.app_id)
         except Exception as exc:  # noqa: BLE001 - GUI boundary reports sanitized text.
             self.auth_status_text.set(str(exc))
+            label = getattr(self, "auth_status_label", None)
+            if label is not None:
+                label.configure(text_color=self.colors["danger"])
             return
-        self.auth_status_text.set(
-            "API anahtarı hazır." if status.has_api_key else "API anahtarı gerekli."
+        notice, tone = api_key_notice(
+            has_api_key=status.has_api_key,
+            delivery_mode=self._delivery_mode_value(),
         )
+        self.auth_status_text.set(notice)
+        label = getattr(self, "auth_status_label", None)
+        if label is not None:
+            label.configure(text_color=self.colors[tone])
         self._refresh_pipeline_buttons()
 
     def _set_profile_status(self, text: str, level: str = "muted") -> None:
@@ -915,8 +1239,8 @@ class ModlistTranslationInstallerApp:
     def _on_delivery_mode_changed(self) -> None:
         self._stop_nxm_capture()
         self._reset_download_state()
+        self._refresh_auth_status()
         self._refresh_non_premium_prompt()
-        self._refresh_pipeline_buttons()
         self._log(f"İndirme yöntemi: {self.delivery_mode.get()}")
         if self.profile_scan_path is not None:
             self._run_preflight()
@@ -927,7 +1251,7 @@ class ModlistTranslationInstallerApp:
             return
         if not self._ensure_profile_continue_confirmed():
             return
-        if not self._api_key():
+        if self._delivery_mode_value() == "PREMIUM_API" and not self._api_key():
             messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
             return
         if self.premium_plan_result is None:
@@ -939,7 +1263,7 @@ class ModlistTranslationInstallerApp:
         if not self.profile_scan_path or not self._ensure_profile_continue_confirmed():
             return
         api_key = self._api_key()
-        if not api_key:
+        if self._delivery_mode_value() == "PREMIUM_API" and not api_key:
             messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
             return
         out_dir = self._run_workspace() / "runtime"
@@ -1099,9 +1423,6 @@ class ModlistTranslationInstallerApp:
             messagebox.showwarning("İndirme hazır değil", "Önce indirme hazırlığı yapılmalı.")
             return
         api_key = self._api_key()
-        if not api_key:
-            messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
-            return
         nxm_url = self.nxm_link.get().strip()
         if not nxm_url:
             messagebox.showwarning(
@@ -1390,7 +1711,8 @@ class ModlistTranslationInstallerApp:
             pass
 
     def _write_runtime_manifest(self) -> Path:
-        return copy_default_bundled_manifest(self._run_workspace() / "manifest")
+        output_path = self._run_workspace() / "manifest" / "manifest.json"
+        return write_wizard_manifest(self.manifest, output_path).manifest_path
 
     def _current_download_queue_path(self) -> Path:
         if self.non_premium_download_result is not None:
@@ -1522,6 +1844,10 @@ class ModlistTranslationInstallerApp:
             text=state.prepare_label,
             state=tk.NORMAL if state.can_prepare else tk.DISABLED,
         )
+        if hasattr(self, "manifest_mode_control"):
+            self.manifest_mode_control.configure(
+                state=tk.DISABLED if self.busy else tk.NORMAL
+            )
         if not self.download_status_text.get() or self.download_status_text.get().endswith(("açılır.", "acilir.")):
             self.download_status_text.set(state.download_hint)
         if (
@@ -1984,7 +2310,192 @@ class ModlistTranslationInstallerApp:
         if hasattr(self, "scroll_canvas"):
             self.scroll_canvas.unbind_all("<MouseWheel>")
         self._stop_nxm_capture()
+        clear_default_remote_manifest_cache()
         self.root.destroy()
+
+
+class ManifestRecoveryApp:
+    """Keep the application usable when neither OTA nor local data can load."""
+
+    def __init__(self, root: ctk.CTk, *, initial_error: BaseException) -> None:
+        self.root = root
+        self.release_info = default_release_info()
+        self.selected_mode = MANIFEST_MODE_OTA
+        self.busy = False
+        self.status_text = tk.StringVar(value="Çeviri listesi yüklenemedi.")
+        self.detail_text = tk.StringVar(value=str(initial_error))
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+        self.root.title("Çeviri listesi bağlantısı")
+        self.root.geometry("780x470")
+        self.root.minsize(680, 420)
+        self.root.configure(fg_color="#101114")
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+        self._build()
+
+    def _build(self) -> None:
+        card = ctk.CTkFrame(
+            self.root,
+            fg_color="#181a1f",
+            border_width=1,
+            border_color="#30343d",
+            corner_radius=16,
+        )
+        card.pack(fill=tk.BOTH, expand=True, padx=24, pady=24)
+        card.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            card,
+            text="Çeviri listesi bağlantısı",
+            text_color="#f3f4f6",
+            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=24, pady=(24, 6))
+        ctk.CTkLabel(
+            card,
+            text=f"Paket: {self.release_info['release_id']}",
+            text_color="#a4acb9",
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+        ).grid(row=1, column=0, sticky="w", padx=24)
+        ctk.CTkLabel(
+            card,
+            text=(
+                "OTA kaynağını yeniden deneyebilir veya release klasöründeki "
+                "yerel manifesti kullanabilirsiniz."
+            ),
+            text_color="#d1d5db",
+            justify=tk.LEFT,
+            anchor="w",
+            wraplength=700,
+            font=ctk.CTkFont(family="Segoe UI", size=14),
+        ).grid(row=2, column=0, sticky="ew", padx=24, pady=(18, 12))
+
+        self.mode_control = ctk.CTkSegmentedButton(
+            card,
+            values=[MANIFEST_MODE_OTA_LABEL, MANIFEST_MODE_LOCAL_LABEL],
+            command=self._on_mode_changed,
+            selected_color="#7c3f18",
+            selected_hover_color="#965024",
+            unselected_color="#2a2f39",
+            unselected_hover_color="#343a46",
+            corner_radius=8,
+            height=34,
+        )
+        self.mode_control.grid(row=3, column=0, sticky="w", padx=24)
+        self.mode_control.set(MANIFEST_MODE_OTA_LABEL)
+
+        ctk.CTkLabel(
+            card,
+            textvariable=self.status_text,
+            text_color="#fbbf24",
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+        ).grid(row=4, column=0, sticky="ew", padx=24, pady=(20, 6))
+        ctk.CTkLabel(
+            card,
+            textvariable=self.detail_text,
+            text_color="#f87171",
+            justify=tk.LEFT,
+            anchor="nw",
+            wraplength=700,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+        ).grid(row=5, column=0, sticky="nsew", padx=24, pady=(0, 18))
+        card.rowconfigure(5, weight=1)
+
+        buttons = ctk.CTkFrame(card, fg_color="transparent")
+        buttons.grid(row=6, column=0, sticky="ew", padx=24, pady=(0, 24))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=0)
+        self.retry_button = ctk.CTkButton(
+            buttons,
+            text="Seçili kaynağı yükle",
+            command=self._retry,
+            fg_color="#7c3f18",
+            hover_color="#965024",
+            corner_radius=9,
+            height=42,
+        )
+        self.retry_button.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        ctk.CTkButton(
+            buttons,
+            text="Kapat",
+            command=self._close,
+            fg_color="#2a2f39",
+            hover_color="#343a46",
+            corner_radius=9,
+            width=120,
+            height=42,
+        ).grid(row=0, column=1)
+
+    def _close(self) -> None:
+        clear_default_remote_manifest_cache()
+        self.root.destroy()
+
+    def _on_mode_changed(self, selected_label: str) -> None:
+        self.selected_mode = (
+            MANIFEST_MODE_LOCAL
+            if selected_label == MANIFEST_MODE_LOCAL_LABEL
+            else MANIFEST_MODE_OTA
+        )
+        if self.selected_mode == MANIFEST_MODE_OTA:
+            self.status_text.set("OTA kaynağı seçildi.")
+            self.detail_text.set("GitHub manifest kanalı ve doğrulanmış önbellek kontrol edilecek.")
+        else:
+            self.status_text.set("Yerel kaynak seçildi.")
+            self.detail_text.set("release/manifest.json ve SHA-256 dosyası kullanılacak.")
+
+    def _retry(self) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        self.mode_control.configure(state=tk.DISABLED)
+        self.retry_button.configure(state=tk.DISABLED)
+        self.status_text.set(
+            "OTA çeviri listesi kontrol ediliyor..."
+            if self.selected_mode == MANIFEST_MODE_OTA
+            else "Yerel çeviri listesi kontrol ediliyor..."
+        )
+        self.detail_text.set("")
+
+        def worker() -> None:
+            try:
+                manifest = load_default_bundled_manifest(
+                    manifest_mode=self.selected_mode
+                )
+                source_info = default_manifest_source_info()
+            except Exception as exc:  # noqa: BLE001 - recovery screen reports safe text.
+                self.root.after(0, lambda error=exc: self._load_failed(error))
+                return
+            self.root.after(
+                0,
+                lambda payload=manifest, info=source_info: self._load_succeeded(
+                    payload,
+                    info,
+                ),
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _load_failed(self, error: BaseException) -> None:
+        self.busy = False
+        self.mode_control.configure(state=tk.NORMAL)
+        self.retry_button.configure(state=tk.NORMAL)
+        self.status_text.set("Çeviri listesi yüklenemedi.")
+        self.detail_text.set(str(error))
+
+    def _load_succeeded(
+        self,
+        manifest: dict[str, Any],
+        source_info: dict[str, str | None],
+    ) -> None:
+        for child in self.root.winfo_children():
+            child.destroy()
+        ModlistTranslationInstallerApp(
+            self.root,
+            initial_manifest=manifest,
+            initial_manifest_mode=self.selected_mode,
+            initial_source_info=source_info,
+        )
 
 
 def _create_credential_store() -> CredentialStore:
@@ -1996,7 +2507,18 @@ def _create_credential_store() -> CredentialStore:
 
 def main() -> None:
     root = ctk.CTk()
-    ModlistTranslationInstallerApp(root)
+    try:
+        manifest = load_default_bundled_manifest(manifest_mode=MANIFEST_MODE_OTA)
+        source_info = default_manifest_source_info()
+    except Exception as exc:  # noqa: BLE001 - recovery UI keeps startup usable.
+        ManifestRecoveryApp(root, initial_error=exc)
+    else:
+        ModlistTranslationInstallerApp(
+            root,
+            initial_manifest=manifest,
+            initial_manifest_mode=MANIFEST_MODE_OTA,
+            initial_source_info=source_info,
+        )
     root.mainloop()
 
 

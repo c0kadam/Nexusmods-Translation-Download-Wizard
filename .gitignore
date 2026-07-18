@@ -2,10 +2,15 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.codex/
+.agents/
+memory-bank/
 build/
 dist/
 release/
 tmp/
+temp/
+scratch/
 runs/
 downloads/
 staging/
@@ -22,4 +27,6 @@ src/modlist_translation_wizard/resources/releases/*/curated_sources/
 *.zip
 *.part
 *.log
+*.bak
+*.tmp
 nuitka-crash-report.xml

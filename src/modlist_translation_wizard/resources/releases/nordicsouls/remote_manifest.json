@@ -1,0 +1,16 @@
+{
+  "schema_version": "mtw-remote-manifest-config.v1",
+  "enabled": true,
+  "list_id": "nordicsouls",
+  "remote_list_id": "NordicSouls",
+  "channel": "stable",
+  "repository": "c0kadam/NTDW-TranslationMAPS",
+  "branch": "main",
+  "index_path": "{remote_list_id}/{channel}/index.json",
+  "allow_hosts": [
+    "raw.githubusercontent.com"
+  ],
+  "cache_ttl_seconds": 0,
+  "timeout_seconds": 8,
+  "allow_stale_cache": false
+}

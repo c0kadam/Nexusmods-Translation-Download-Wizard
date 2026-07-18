@@ -5,14 +5,26 @@ from __future__ import annotations
 import json
 import hashlib
 import shutil
+import stat
+import zipfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from modlist_translate_tool.archives.archive_index import _resolve_7z
+from modlist_translate_tool.archives.safe_paths import (
+    UnsafeArchivePathError,
+    ensure_inside,
+    normalize_archive_member_path,
+)
 from modlist_translate_tool.archives.safe_extractor import (
     ExtractionLimits,
     extract_zip_item,
+)
+from modlist_translate_tool.archives.seven_zip import (
+    SevenZipCommandError,
+    extract_member_to_path,
 )
 from modlist_translate_tool.downloads.local_store import planned_archive_path
 from modlist_translate_tool.downloads.models import DownloadQueueItem, DownloadRequest
@@ -65,6 +77,9 @@ class WizardConversionResult:
 MTW_CONVERSION_MANIFEST_NAME = "mtw_dsd_conversion_manifest.json"
 MTW_CONVERSION_REPORT_NAME = "mtw_dsd_conversion_report.md"
 _ADD_ON_ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar"}
+_NATIVE_BINARY_INSTALL_MODE = "NATIVE_BINARY_INSTALL"
+_NATIVE_BINARY_MANAGED_STATE_RELATIVE = ".mtw/managed_native_binary_assets.json"
+_NATIVE_BINARY_MAX_BYTES = 256 * 1024 * 1024
 _ADD_ON_EXTRACTION_LIMITS = ExtractionLimits(
     max_files=20_000,
     max_total_uncompressed_bytes=4 * 1024 * 1024 * 1024,
@@ -269,6 +284,12 @@ def plan_downloads_from_manifest(
         download_dir=Path(download_dir),
         download_cache_roots=download_cache_roots,
     )
+    plan = _append_native_binary_assets_to_download_plan(
+        plan,
+        manifest=manifest,
+        download_dir=Path(download_dir),
+        download_cache_roots=download_cache_roots,
+    )
     return WizardPremiumPlanResult(preflight_path, decisions_path, plan, preflight)
 
 
@@ -413,15 +434,29 @@ def convert_downloaded_translations_from_manifest(
         staging_root=stage_root,
         out_dir=output_dir,
     )
+    _write_conversion_progress(progress_status_path, "applying_native_binary_assets")
+    binary_payload = _apply_native_binary_assets(
+        manifest=manifest,
+        queue_payload=queue_payload,
+        output_mod_path=Path(conversion.output_mod_path),
+        out_dir=output_dir,
+        seven_zip_path=Path(seven_zip_path) if seven_zip_path is not None else None,
+        overwrite=overwrite,
+    )
     add_on_summary = add_on_payload.get("summary", {})
+    binary_summary = binary_payload.get("summary", {})
     conversion_failed = int(conversion_summary.get("failed_items") or 0) > 0
     add_on_failed = int(add_on_summary.get("failed") or 0) > 0
+    binary_failed = (
+        int(binary_summary.get("failed") or 0) > 0
+        or int(binary_summary.get("cleanup_failed") or 0) > 0
+    )
     result_payload = {
         "schema_version": "wizard-conversion-result.v1",
         "manifest_id": manifest.get("manifest_id"),
         "status": (
             "COMPLETED_WITH_FAILURES"
-            if conversion_failed or add_on_failed
+            if conversion_failed or add_on_failed or binary_failed
             else "COMPLETED"
         ),
         "install_state": "STAGED_NOT_INSTALLED",
@@ -432,6 +467,7 @@ def convert_downloaded_translations_from_manifest(
         "summary": conversion_summary,
         "downloads": readiness,
         "add_on_packages": add_on_payload,
+        "native_binary_assets": binary_payload,
         "local_dsd_sources": [str(path) for path in local_dsd_sources],
     }
     _write_conversion_progress(progress_status_path, "writing_result")
@@ -694,6 +730,115 @@ def _append_add_on_packages_to_download_plan(
     )
 
 
+def _append_native_binary_assets_to_download_plan(
+    plan: DownloadPlanRunResult,
+    *,
+    manifest: dict[str, Any],
+    download_dir: Path,
+    download_cache_roots: list[Path],
+) -> DownloadPlanRunResult:
+    assets = _manifest_native_binary_assets(manifest)
+    if not assets:
+        return plan
+
+    queue_payload = json.loads(json.dumps(plan.queue_payload))
+    plan_payload = json.loads(json.dumps(plan.plan_payload))
+    queue_items = [
+        item
+        for item in queue_payload.get("items", [])
+        if isinstance(item, dict)
+    ]
+    existing_identities = {
+        identity
+        for identity in (_queue_item_identity(item) for item in queue_items)
+        if identity is not None
+    }
+    plan_body = plan_payload.setdefault("plan", {})
+    plan_requests = plan_body.setdefault("requests", [])
+    added = 0
+
+    for asset in assets:
+        identity = _native_binary_asset_identity(asset)
+        if identity in existing_identities:
+            for item in queue_items:
+                if _queue_item_identity(item) == identity:
+                    item.setdefault("mtw_native_binary_assets", []).append(
+                        _native_binary_asset_public_payload(asset)
+                    )
+                    item["warnings"] = _dedupe_strings(
+                        [
+                            *[str(warning) for warning in item.get("warnings", [])],
+                            "mtw_native_binary_asset_reuses_existing_queue_item",
+                        ]
+                    )
+                    break
+            continue
+
+        request = _download_request_from_native_binary_asset(asset)
+        target = planned_archive_path(download_dir, request)
+        existing_archive = _existing_add_on_archive_for_request(
+            request,
+            target,
+            download_cache_roots,
+        )
+        item_warnings = ["mtw_native_binary_asset"]
+        if existing_archive is not None:
+            status = "READY"
+            local_archive_path = str(existing_archive)
+            item_warnings.append("archive_already_present_for_nexus_file_identity")
+        else:
+            status = "PLANNED"
+            local_archive_path = str(target)
+
+        queue_item = asdict(
+            DownloadQueueItem(
+                request=request,
+                status=status,
+                local_archive_path=local_archive_path,
+                attempts=0,
+                warnings=item_warnings,
+            )
+        )
+        queue_item["mtw_native_binary_assets"] = [
+            _native_binary_asset_public_payload(asset)
+        ]
+        queue_items.append(queue_item)
+        plan_requests.append(asdict(request))
+        existing_identities.add(identity)
+        added += 1
+
+    if added == 0:
+        queue_payload["items"] = queue_items
+    else:
+        queue_payload["items"] = queue_items
+        plan_body["total_requests"] = len(plan_requests)
+        plan_body["warnings"] = _dedupe_strings(
+            [
+                *[str(warning) for warning in plan_body.get("warnings", [])],
+                "mtw_native_binary_assets_appended",
+            ]
+        )
+
+    queue_payload["summary"] = _queue_summary_from_items(queue_items)
+    manifest_payload = queue_payload.get("manifest")
+    if isinstance(manifest_payload, dict):
+        manifest_payload["items"] = queue_items
+
+    _write_json(plan.plan_path, plan_payload)
+    _write_json(plan.queue_path, queue_payload)
+    plan.report_path.write_text(
+        render_download_plan_report(plan_payload, queue_payload),
+        encoding="utf-8",
+    )
+    return DownloadPlanRunResult(
+        plan_path=plan.plan_path,
+        queue_path=plan.queue_path,
+        report_path=plan.report_path,
+        plan_payload=plan_payload,
+        queue_payload=queue_payload,
+    )
+
+
 def _apply_add_on_packages(
     *,
     manifest: dict[str, Any],
@@ -796,6 +941,98 @@ def _apply_add_on_packages(
     return payload
 
 
+def _apply_native_binary_assets(
+    *,
+    manifest: dict[str, Any],
+    queue_payload: dict[str, Any],
+    output_mod_path: Path,
+    out_dir: Path,
+    seven_zip_path: Path | None,
+    overwrite: bool,
+) -> dict[str, Any]:
+    assets = _manifest_native_binary_assets(manifest)
+    previous_state = _read_native_binary_state(output_mod_path)
+    desired = {_normalize_target(asset["target_path"]) for asset in assets}
+    cleanup_items = _cleanup_stale_native_binary_assets(
+        output_mod_path,
+        previous_state,
+        desired,
+    )
+    items: list[dict[str, Any]] = []
+    installed_state: list[dict[str, Any]] = []
+    for asset in assets:
+        public_asset = _native_binary_asset_public_payload(asset)
+        archive_path = _queue_archive_for_identity(
+            queue_payload,
+            _native_binary_asset_identity(asset),
+        )
+        if archive_path is None:
+            status = "FAILED" if asset.get("required", True) else "SKIPPED_MISSING"
+            items.append(
+                {
+                    "asset": public_asset,
+                    "status": status,
+                    "archive_path": None,
+                    "output_path": None,
+                    "warnings": ["native_binary_asset_archive_missing"],
+                    "failure_reason": (
+                        "archive_missing" if asset.get("required", True) else None
+                    ),
+                }
+            )
+            continue
+
+        result = _extract_native_binary_asset(
+            asset,
+            archive_path=archive_path,
+            output_mod_path=output_mod_path,
+            seven_zip_path=seven_zip_path,
+            overwrite=overwrite,
+        )
+        result["asset"] = public_asset
+        items.append(result)
+        if result.get("status") == "EXTRACTED":
+            installed_state.append(
+                {
+                    "target_path": asset["target_path"],
+                    "normalized_target_path": _normalize_target(asset["target_path"]),
+                    "artifact_id": asset["artifact_id"],
+                    "archive_member": result.get("archive_member") or asset["archive_member"],
+                    "game_domain": asset["game_domain"],
+                    "translation_nexus_mod_id": asset["translation_nexus_mod_id"],
+                    "translation_file_id": asset["translation_file_id"],
+                    "sha256": result.get("sha256"),
+                }
+            )
+
+    _write_native_binary_state(output_mod_path, installed_state)
+    summary = {
+        "asset_count": len(assets),
+        "extracted": sum(1 for item in items if item.get("status") == "EXTRACTED"),
+        "skipped_missing": sum(
+            1 for item in items if item.get("status") == "SKIPPED_MISSING"
+        ),
+        "failed": sum(1 for item in items if item.get("status") == "FAILED"),
+        "cleanup_removed": sum(
+            1 for item in cleanup_items if item.get("status") == "REMOVED"
+        ),
+        "cleanup_failed": sum(
+            1 for item in cleanup_items if item.get("status") == "FAILED"
+        ),
+    }
+    payload = {
+        "schema_version": "wizard-native-binary-assets.v1",
+        "summary": summary,
+        "items": items,
+        "cleanup": cleanup_items,
+        "state_path": str(_native_binary_state_path(output_mod_path)),
+    }
+    result_path = out_dir / "wizard_native_binary_assets.json"
+    _write_json(result_path, payload)
+    payload["result_path"] = str(result_path)
+    return payload
+
+
 def _manifest_add_on_packages(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     packages: list[dict[str, Any]] = []
     raw_packages = manifest.get("add_on_packages", [])
@@ -854,6 +1091,71 @@ def _manifest_add_on_packages(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     )
 
 
+def _manifest_native_binary_assets(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    assets: list[dict[str, Any]] = []
+    for entry_index, entry in enumerate(manifest.get("entries", [])):
+        if not isinstance(entry, dict):
+            continue
+        install = entry.get("install") if isinstance(entry.get("install"), dict) else {}
+        if str(install.get("mode") or "").strip().upper() != _NATIVE_BINARY_INSTALL_MODE:
+            continue
+        target = entry.get("target") if isinstance(entry.get("target"), dict) else {}
+        target_path = _optional_text(target.get("path"))
+        if target_path is None:
+            continue
+        for artifact_index, raw_artifact in enumerate(entry.get("artifacts", [])):
+            if not isinstance(raw_artifact, dict):
+                continue
+            if str(raw_artifact.get("install_mode") or "").strip().upper() != _NATIVE_BINARY_INSTALL_MODE:
+                continue
+            mod_id = _positive_int(raw_artifact.get("translation_nexus_mod_id"))
+            file_id = _positive_int(raw_artifact.get("translation_file_id"))
+            game_domain = str(raw_artifact.get("game_domain") or "skyrimspecialedition").strip().casefold()
+            archive_member = _optional_text(raw_artifact.get("archive_member"))
+            if mod_id is None or file_id is None or not game_domain or archive_member is None:
+                continue
+            asset_id = str(
+                raw_artifact.get("binary_asset_id")
+                or raw_artifact.get("artifact_id")
+                or f"nexusmods:{game_domain}:{mod_id}:{file_id}:{target_path}"
+            ).strip()
+            assets.append(
+                {
+                    **raw_artifact,
+                    "id": asset_id,
+                    "entry_index": entry_index,
+                    "artifact_index": artifact_index,
+                    "target_id": entry.get("target_id"),
+                    "target_path": target_path,
+                    "game_domain": game_domain,
+                    "translation_nexus_mod_id": mod_id,
+                    "translation_file_id": file_id,
+                    "translation_name": (
+                        raw_artifact.get("translation_name")
+                        or (entry.get("selection") or {}).get("translation_name")
+                        or f"Native binary asset {mod_id}/{file_id}"
+                    ),
+                    "archive_member": archive_member,
+                    "expected_file_sha256": _optional_text(
+                        raw_artifact.get("expected_file_sha256")
+                        or raw_artifact.get("file_sha256")
+                    ),
+                    "required": raw_artifact.get("required") is not False,
+                    "apply_order": _non_negative_int(raw_artifact.get("apply_order"))
+                    or entry_index,
+                }
+            )
+    return sorted(
+        assets,
+        key=lambda item: (
+            int(item.get("apply_order") or 0),
+            int(item.get("entry_index") or 0),
+            int(item.get("artifact_index") or 0),
+            str(item.get("id") or "").casefold(),
+        ),
+    )
+
+
 def _download_request_from_add_on_package(package: dict[str, Any]) -> DownloadRequest:
     return DownloadRequest(
         game_domain=package["game_domain"],
@@ -870,11 +1172,35 @@ def _download_request_from_add_on_package(package: dict[str, Any]) -> DownloadRe
     )
 
 
+def _download_request_from_native_binary_asset(asset: dict[str, Any]) -> DownloadRequest:
+    return DownloadRequest(
+        game_domain=asset["game_domain"],
+        translation_nexus_mod_id=asset["translation_nexus_mod_id"],
+        translation_file_id=asset["translation_file_id"],
+        translation_name=asset["translation_name"],
+        translation_file_name=asset.get("translation_file_name"),
+        source_candidate_id=f"mtw-native-binary-asset:{asset['id']}",
+        decision_status="APPROVED",
+        expected_size=asset.get("expected_size"),
+        expected_hash=asset.get("expected_sha256"),
+        url=asset.get("source_url"),
+        warnings=["mtw_native_binary_asset"],
+    )
+
+
 def _add_on_package_identity(package: dict[str, Any]) -> tuple[str, int, int]:
     return (
         str(package["game_domain"]).casefold(),
         int(package["translation_nexus_mod_id"]),
         int(package["translation_file_id"]),
+    )
+
+
+def _native_binary_asset_identity(asset: dict[str, Any]) -> tuple[str, int, int]:
+    return (
+        str(asset["game_domain"]).casefold(),
+        int(asset["translation_nexus_mod_id"]),
+        int(asset["translation_file_id"]),
     )
 
 
@@ -891,6 +1217,330 @@ def _add_on_package_public_payload(package: dict[str, Any]) -> dict[str, Any]:
         "required": package.get("required", True),
         "source_url": package.get("source_url"),
     }
+
+
+def _native_binary_asset_public_payload(asset: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "id": asset["id"],
+        "target_id": asset.get("target_id"),
+        "target_path": asset["target_path"],
+        "archive_member": asset["archive_member"],
+        "game_domain": asset["game_domain"],
+        "translation_nexus_mod_id": asset["translation_nexus_mod_id"],
+        "translation_file_id": asset["translation_file_id"],
+        "translation_file_name": asset.get("translation_file_name"),
+        "install_mode": _NATIVE_BINARY_INSTALL_MODE,
+        "required": asset.get("required", True),
+        "source_url": asset.get("source_url"),
+    }
+    candidates = _as_list(asset.get("archive_member_candidates"))
+    if candidates:
+        payload["archive_member_candidates"] = [
+            str(item) for item in candidates if isinstance(item, str)
+        ]
+    return payload
+
+
+def _extract_native_binary_asset(
+    asset: dict[str, Any],
+    *,
+    archive_path: Path,
+    output_mod_path: Path,
+    seven_zip_path: Path | None,
+    overwrite: bool,
+) -> dict[str, Any]:
+    try:
+        target_path = _safe_native_binary_output_path(output_mod_path, asset["target_path"])
+        archive_members = _safe_native_binary_archive_members(asset)
+    except (KeyError, UnsafeArchivePathError, ValueError) as exc:
+        return _native_binary_failure(asset, archive_path, "invalid_binary_asset_path", str(exc))
+
+    if target_path.exists() and not overwrite:
+        return _native_binary_failure(
+            asset,
+            archive_path,
+            "output_file_exists",
+            f"output_file_exists: {target_path}",
+            output_path=target_path,
+        )
+
+    archive_member = archive_members[0]
+    if archive_path.suffix.casefold() == ".zip":
+        last_exc: Exception | None = None
+        for candidate in archive_members:
+            try:
+                _extract_native_binary_from_zip(
+                    archive_path,
+                    candidate,
+                    target_path,
+                )
+                archive_member = candidate
+                last_exc = None
+                break
+            except (OSError, zipfile.BadZipFile, KeyError, ValueError) as exc:
+                target_path.unlink(missing_ok=True)
+                last_exc = exc
+        if last_exc is not None:
+            return _native_binary_failure(
+                asset,
+                archive_path,
+                _native_binary_failure_reason(last_exc),
+                str(last_exc),
+                output_path=target_path,
+            )
+    elif archive_path.suffix.casefold() in {".7z", ".rar"}:
+        seven_zip = seven_zip_path or _resolve_7z()
+        if seven_zip is None:
+            return _native_binary_failure(
+                asset,
+                archive_path,
+                "7z_not_available",
+                "7z_not_available",
+                output_path=target_path,
+            )
+        last_exc = None
+        for candidate in archive_members:
+            try:
+                extract_member_to_path(
+                    seven_zip,
+                    archive_path,
+                    candidate,
+                    target_path,
+                    require_nonempty=True,
+                )
+                archive_member = candidate
+                last_exc = None
+                break
+            except (OSError, SevenZipCommandError, ValueError) as exc:
+                target_path.unlink(missing_ok=True)
+                last_exc = exc
+        if last_exc is not None:
+            return _native_binary_failure(
+                asset,
+                archive_path,
+                _native_binary_failure_reason(last_exc),
+                str(last_exc),
+                output_path=target_path,
+            )
+    else:
+        return _native_binary_failure(
+            asset,
+            archive_path,
+            "unsupported_archive_format",
+            f"unsupported_archive_format: {archive_path.suffix or 'none'}",
+            output_path=target_path,
+        )
+
+    size = target_path.stat().st_size
+    if size <= 0:
+        target_path.unlink(missing_ok=True)
+        return _native_binary_failure(
+            asset,
+            archive_path,
+            "extracted_member_empty",
+            "extracted_member_empty",
+            output_path=target_path,
+        )
+    if size > _NATIVE_BINARY_MAX_BYTES:
+        target_path.unlink(missing_ok=True)
+        return _native_binary_failure(
+            asset,
+            archive_path,
+            "max_single_file_bytes_exceeded",
+            f"size={size} limit={_NATIVE_BINARY_MAX_BYTES}",
+            output_path=target_path,
+        )
+
+    sha256 = _file_sha256(target_path)
+    expected_file_sha256 = str(asset.get("expected_file_sha256") or "").strip().casefold()
+    if expected_file_sha256 and sha256 != expected_file_sha256:
+        target_path.unlink(missing_ok=True)
+        return _native_binary_failure(
+            asset,
+            archive_path,
+            "file_sha256_mismatch",
+            f"expected={expected_file_sha256} actual={sha256}",
+            output_path=target_path,
+        )
+
+    return {
+        "status": "EXTRACTED",
+        "archive_path": str(archive_path),
+        "archive_member": archive_member,
+        "output_path": str(target_path),
+        "relative_path": normalize_archive_member_path(asset["target_path"]),
+        "size": size,
+        "sha256": sha256,
+        "warnings": [],
+        "failure_reason": None,
+    }
+
+
+def _extract_native_binary_from_zip(
+    archive_path: Path,
+    archive_member: str,
+    target_path: Path,
+) -> None:
+    with zipfile.ZipFile(archive_path) as archive:
+        info = archive.getinfo(archive_member)
+        if info.is_dir() or _zipinfo_is_symlink(info):
+            raise ValueError("binary archive member is not a regular file")
+        if info.file_size > _NATIVE_BINARY_MAX_BYTES:
+            raise ValueError(
+                f"max_single_file_bytes_exceeded: "
+                f"size={info.file_size} limit={_NATIVE_BINARY_MAX_BYTES}"
+            )
+        if info.file_size <= 0:
+            raise ValueError("extracted_member_empty")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target_path.with_name(f".{target_path.name}.mtw-tmp")
+        try:
+            with archive.open(info, "r") as source:
+                with temporary.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+            temporary.replace(target_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _zipinfo_is_symlink(info: zipfile.ZipInfo) -> bool:
+    return ((info.external_attr >> 16) & 0o170000) == stat.S_IFLNK
+
+
+def _native_binary_failure(
+    asset: dict[str, Any],
+    archive_path: Path | None,
+    reason: str,
+    warning: str,
+    *,
+    output_path: Path | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "FAILED" if asset.get("required", True) else "SKIPPED_MISSING",
+        "archive_path": str(archive_path) if archive_path is not None else None,
+        "archive_member": asset.get("archive_member"),
+        "output_path": str(output_path) if output_path is not None else None,
+        "warnings": [warning],
+        "failure_reason": reason,
+    }
+
+
+def _native_binary_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, SevenZipCommandError):
+        return exc.reason
+    if isinstance(exc, KeyError):
+        return "archive_member_missing"
+    if isinstance(exc, zipfile.BadZipFile):
+        return "zip_extract_failed"
+    return "native_binary_extract_failed"
+
+
+def _safe_native_binary_output_path(root: Path, relative_path: object) -> Path:
+    normalized = normalize_archive_member_path(str(relative_path or ""))
+    if not _normalize_target(normalized).startswith("skse/plugins/"):
+        raise ValueError("native binary target must be under SKSE/Plugins")
+    if Path(normalized).suffix.casefold() != ".dll":
+        raise ValueError("native binary target must be a DLL")
+    return ensure_inside(root, root.joinpath(*normalized.split("/")))
+
+
+def _safe_native_binary_archive_member(value: object) -> str:
+    normalized = normalize_archive_member_path(str(value or ""))
+    if Path(normalized).suffix.casefold() != ".dll":
+        raise ValueError("native binary archive member must be a DLL")
+    return normalized
+
+
+def _safe_native_binary_archive_members(asset: dict[str, Any]) -> list[str]:
+    raw_values = [
+        asset["archive_member"],
+        *_as_list(asset.get("archive_member_candidates")),
+    ]
+    members: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        member = _safe_native_binary_archive_member(value)
+        key = member.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        members.append(member)
+    if not members:
+        raise ValueError("native binary archive member is required")
+    return members
+
+
+def _native_binary_state_path(output_mod_path: Path) -> Path:
+    return _safe_manifest_output_path(output_mod_path, _NATIVE_BINARY_MANAGED_STATE_RELATIVE)
+
+
+def _read_native_binary_state(output_mod_path: Path) -> list[dict[str, Any]]:
+    state_path = _native_binary_state_path(output_mod_path)
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    items = payload.get("items") if isinstance(payload, dict) else None
+    return [item for item in _as_list(items) if isinstance(item, dict)]
+
+
+def _write_native_binary_state(output_mod_path: Path, items: list[dict[str, Any]]) -> None:
+    state_path = _native_binary_state_path(output_mod_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        state_path,
+        {
+            "schema_version": "mtw-managed-native-binary-assets.v1",
+            "managed_by": "modlist_translation_wizard",
+            "items": items,
+        },
+    )
+
+
+def _cleanup_stale_native_binary_assets(
+    output_mod_path: Path,
+    previous_state: list[dict[str, Any]],
+    desired_targets: set[str],
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for item in previous_state:
+        target_path = str(item.get("target_path") or "")
+        normalized = _normalize_target(
+            item.get("normalized_target_path") or target_path
+        )
+        if not normalized or normalized in desired_targets:
+            continue
+        try:
+            path = _safe_manifest_output_path(output_mod_path, target_path)
+            if path.exists():
+                path.unlink()
+                status = "REMOVED"
+            else:
+                status = "MISSING"
+            results.append(
+                {
+                    "status": status,
+                    "target_path": target_path,
+                    "output_path": str(path),
+                    "failure_reason": None,
+                }
+            )
+        except (OSError, UnsafeArchivePathError) as exc:
+            results.append(
+                {
+                    "status": "FAILED",
+                    "target_path": target_path,
+                    "output_path": None,
+                    "failure_reason": "cleanup_failed",
+                    "warnings": [str(exc)],
+                }
+            )
+    return results
+
+
+def _safe_manifest_output_path(root: Path, relative_path: object) -> Path:
+    normalized = normalize_archive_member_path(str(relative_path or ""))
+    return ensure_inside(root, root.joinpath(*normalized.split("/")))
 
 
 def _existing_add_on_archive_for_request(
@@ -1026,6 +1676,9 @@ def _manifest_decisions(
     script_alias_modes = _manifest_script_context_alias_output_modes(manifest)
     for entry_index, entry in enumerate(manifest.get("entries", [])):
         if entry.get("target_id") not in matched_entry_ids:
+            continue
+        install = entry.get("install") if isinstance(entry.get("install"), dict) else {}
+        if str(install.get("mode") or "").strip().upper() == _NATIVE_BINARY_INSTALL_MODE:
             continue
         base = entry["base"]
         target = entry["target"]

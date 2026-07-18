@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +26,9 @@ from modlist_translation_wizard.runtime import (
     convert_downloaded_translations_from_manifest,
     load_wizard_conversion_result,
 )
+
+_MAX_WORKER_ATTEMPTS = 2
+_WORKER_RETRY_DELAY_SECONDS = 0.75
 
 
 def run_conversion_in_worker(
@@ -44,8 +49,6 @@ def run_conversion_in_worker(
     status_path = worker_dir / "status.json"
     progress_path = worker_dir / "progress.json"
     result_path = output_dir / "wizard_conversion_result.json"
-    for path in (status_path, progress_path, result_path):
-        path.unlink(missing_ok=True)
     payload = {
         "schema_version": "mtw-conversion-worker-request.v1",
         "manifest_path": str(manifest_path),
@@ -59,32 +62,52 @@ def run_conversion_in_worker(
         "status_path": str(status_path),
         "progress_status_path": str(progress_path),
     }
-    config_path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
 
-    completed = _run_hidden_worker(_worker_command(config_path))
-    status = _read_status(status_path)
-    if status.get("ok") is not True:
+    for attempt in range(1, _MAX_WORKER_ATTEMPTS + 1):
+        for path in (status_path, progress_path, result_path):
+            path.unlink(missing_ok=True)
+        payload["attempt"] = attempt
+        config_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        completed = _run_hidden_worker(_worker_command(config_path))
+        status = _read_status(status_path)
+        if status.get("ok") is True:
+            result_text = str(status.get("result_path") or result_path)
+            return load_wizard_conversion_result(result_text)
+
         recovered = _load_completed_result_if_available(result_path)
         if recovered is not None:
             return recovered
-        error = str(status.get("error") or "").strip()
-        error_type = str(status.get("error_type") or "WorkerFailed")
-        details = f"{error_type}: {error}" if error else error_type
-        stderr = _decode_output(completed.stderr).strip()
-        if stderr:
-            details = f"{details}\n\nWorker stderr:\n{stderr[-2000:]}"
-        raise RuntimeError(
-            "Ceviri hazirlama islemi ayri worker process icinde basarisiz oldu.\n"
-            f"Cikis kodu: {completed.returncode}\n"
-            f"Detay: {details}\n"
-            f"Worker durum dosyasi: {status_path}\n"
-            f"Ilerleme dosyasi: {progress_path}"
+
+        diagnostics_path = _preserve_worker_failure(
+            worker_dir=worker_dir,
+            status_path=status_path,
+            progress_path=progress_path,
+            completed=completed,
+            attempt=attempt,
         )
-    result_text = str(status.get("result_path") or result_path)
-    return load_wizard_conversion_result(result_text)
+        if attempt < _MAX_WORKER_ATTEMPTS and _is_retryable_worker_failure(
+            completed=completed,
+            status=status,
+        ):
+            time.sleep(_WORKER_RETRY_DELAY_SECONDS)
+            continue
+
+        raise RuntimeError(
+            _worker_failure_message(
+                completed=completed,
+                status=status,
+                status_path=status_path,
+                progress_path=progress_path,
+                diagnostics_path=diagnostics_path,
+                attempt=attempt,
+            )
+        )
+
+    raise AssertionError("conversion worker attempt loop ended unexpectedly")
 
 
 def run_conversion_worker(config_path: Path | str) -> int:
@@ -240,6 +263,92 @@ def _read_status(path: Path) -> dict[str, Any]:
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _is_retryable_worker_failure(
+    *,
+    completed: subprocess.CompletedProcess[bytes],
+    status: dict[str, Any],
+) -> bool:
+    if status.get("ok") is True:
+        return False
+    if str(status.get("error_type") or "").strip():
+        return False
+    if str(status.get("error") or "").strip():
+        return False
+    return True
+
+
+def _preserve_worker_failure(
+    *,
+    worker_dir: Path,
+    status_path: Path,
+    progress_path: Path,
+    completed: subprocess.CompletedProcess[bytes],
+    attempt: int,
+) -> Path:
+    snapshots = (
+        (status_path, worker_dir / "last_failed_status.json"),
+        (progress_path, worker_dir / "last_failed_progress.json"),
+    )
+    for source, destination in snapshots:
+        if source.is_file():
+            shutil.copy2(source, destination)
+        else:
+            destination.unlink(missing_ok=True)
+
+    stderr_path = worker_dir / "last_failed_stderr.log"
+    stderr = _decode_output(completed.stderr).strip()
+    if stderr:
+        stderr_path.write_text(stderr[-8000:] + "\n", encoding="utf-8")
+    else:
+        stderr_path.unlink(missing_ok=True)
+
+    diagnostics_path = worker_dir / "last_failed_worker.json"
+    _write_json_atomic(
+        diagnostics_path,
+        {
+            "schema_version": "mtw-conversion-worker-failure.v1",
+            "created_at": _now(),
+            "attempt": attempt,
+            "max_attempts": _MAX_WORKER_ATTEMPTS,
+            "returncode": completed.returncode,
+            "retryable": _is_retryable_worker_failure(
+                completed=completed,
+                status=_read_status(status_path),
+            ),
+            "status_snapshot": str(snapshots[0][1]) if snapshots[0][1].is_file() else None,
+            "progress_snapshot": str(snapshots[1][1]) if snapshots[1][1].is_file() else None,
+            "stderr_snapshot": str(stderr_path) if stderr_path.is_file() else None,
+        },
+    )
+    return diagnostics_path
+
+
+def _worker_failure_message(
+    *,
+    completed: subprocess.CompletedProcess[bytes],
+    status: dict[str, Any],
+    status_path: Path,
+    progress_path: Path,
+    diagnostics_path: Path,
+    attempt: int,
+) -> str:
+    error = str(status.get("error") or "").strip()
+    error_type = str(status.get("error_type") or "WorkerFailed")
+    details = f"{error_type}: {error}" if error else error_type
+    stderr = _decode_output(completed.stderr).strip()
+    if stderr:
+        details = f"{details}\n\nWorker stderr:\n{stderr[-2000:]}"
+    return (
+        "Ceviri hazirlama islemi ayri worker process icinde basarisiz oldu.\n"
+        f"Cikis kodu: {completed.returncode}\n"
+        f"Deneme: {attempt}/{_MAX_WORKER_ATTEMPTS}\n"
+        f"Detay: {details}\n"
+        f"Worker durum dosyasi: {status_path}\n"
+        f"Ilerleme dosyasi: {progress_path}\n"
+        f"Korunan hata tanisi: {diagnostics_path}"
+    )
 
 
 def _write_status(path: Path, payload: dict[str, Any]) -> None:

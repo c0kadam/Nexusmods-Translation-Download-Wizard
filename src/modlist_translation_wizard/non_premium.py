@@ -10,7 +10,9 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from modlist_translate_tool.nexus.api_client import (
+    DEFAULT_NEXUS_API_BASE_URL,
     NexusApiClient,
+    NexusApiResponse,
     NexusDownloadLink,
     NexusRateLimit,
 )
@@ -145,17 +147,15 @@ def failed_non_premium_downloads(
 def run_non_premium_nxm_download(
     *,
     plan: WizardPremiumPlanResult,
-    api_key: str,
+    api_key: str | None = None,
     nxm_url: str,
     queue_path: Path | str | None = None,
     overwrite: bool = False,
     file_downloader: FileDownloader | None = None,
     max_attempts: int = 3,
-    client_factory: Callable[[str], NexusApiClient] | None = None,
+    client_factory: Callable[[str | None], Any] | None = None,
     now: int | None = None,
 ) -> WizardNonPremiumDownloadResult:
-    if not str(api_key or "").strip():
-        raise WizardManifestError("Nexus API key is required for non-Premium downloads.")
     authorization = parse_nxm_download_link(nxm_url, now=now)
     source_queue_path = Path(queue_path or plan.download_plan.queue_path)
     queue_payload = json.loads(source_queue_path.read_text(encoding="utf-8"))
@@ -175,8 +175,14 @@ def run_non_premium_nxm_download(
     }
     _write_json(item_queue_path, item_queue_payload)
 
-    factory = client_factory or (lambda key: NexusApiClient(key))
-    client = _TransientNxmDownloadClient(factory(api_key), authorization)
+    normalized_api_key = str(api_key or "").strip() or None
+    if client_factory is not None:
+        nexus_client = client_factory(normalized_api_key)
+    elif normalized_api_key is not None:
+        nexus_client = NexusApiClient(normalized_api_key)
+    else:
+        nexus_client = _NxmQueryAuthorizationClient()
+    client = _TransientNxmDownloadClient(nexus_client, authorization)
     item_run = download_archives_from_queue(
         queue_path=item_queue_path,
         out_dir=item_root,
@@ -219,7 +225,7 @@ def run_non_premium_nxm_download(
 class _TransientNxmDownloadClient:
     def __init__(
         self,
-        client: NexusApiClient,
+        client: Any,
         authorization: NxmDownloadAuthorization,
     ) -> None:
         self._client = client
@@ -253,6 +259,32 @@ class _TransientNxmDownloadClient:
             f"/download_link.json?{query}"
         )
         return _download_links(response.payload), response.rate_limit
+
+    def operation_lock(self, operation_name: str):
+        return self._client.operation_lock(operation_name)
+
+    def request_telemetry(self) -> dict[str, Any]:
+        return self._client.request_telemetry()
+
+
+class _NxmQueryAuthorizationClient:
+    """Resolve one user-approved NXM link without a personal API key header."""
+
+    def __init__(self) -> None:
+        # This value is never transmitted. NexusApiClient supplies the hardened
+        # HTTP boundary while get_json_url explicitly uses public headers.
+        self._client = NexusApiClient("nxm-query-authorization-only")
+
+    def get_json(self, path: str) -> NexusApiResponse:
+        return self._client.get_json_url(
+            f"{DEFAULT_NEXUS_API_BASE_URL}{path}",
+            include_api_key=False,
+        )
+
+    def get_mod_file(self, game_domain: str, mod_id: int, file_id: int) -> NexusApiResponse:
+        # File metadata is optional for the downloader and would require a
+        # separate authenticated API request. The CDN response restores names.
+        return NexusApiResponse(payload={})
 
     def operation_lock(self, operation_name: str):
         return self._client.operation_lock(operation_name)

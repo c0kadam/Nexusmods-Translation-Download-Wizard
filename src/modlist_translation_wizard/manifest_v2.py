@@ -13,8 +13,8 @@ from modlist_translation_wizard.version import TOOL_NAME, __version__
 
 WIZARD_MANIFEST_SCHEMA_VERSION = "mtt-wizard-manifest.v2"
 _SUPPORTED_CHANNELS = {"stable", "extended"}
-_TARGET_TYPES = {"PLUGIN", "INTERFACE", "BESTIARY", "NATIVE"}
-_INSTALL_MODES = {"DSD_CONVERT", "NATIVE_INSTALL", "BUNDLE_DSD"}
+_TARGET_TYPES = {"PLUGIN", "INTERFACE", "BESTIARY", "NATIVE", "NATIVE_BINARY"}
+_INSTALL_MODES = {"DSD_CONVERT", "NATIVE_INSTALL", "BUNDLE_DSD", "NATIVE_BINARY_INSTALL"}
 _ADD_ON_INSTALL_MODES = {"OUTPUT_MOD_OVERLAY"}
 _CONFIDENCE_LEVELS = {
     "VERIFIED_CURATED",
@@ -236,7 +236,6 @@ def build_wizard_manifest(
             "authentication": {
                 "primary": "REGISTERED_APPLICATION_SSO",
                 "registered_app_slug": _clean_text(registered_app_slug),
-                "manual_api_key": "TESTING_ONLY",
                 "secret_storage": "OS_CREDENTIAL_STORE",
             },
             "delivery": {
@@ -511,6 +510,27 @@ def _validate_artifact(
     artifact_ids.add(artifact_id)
     if artifact.get("install_mode") not in _INSTALL_MODES:
         raise WizardManifestError(f"artifact has invalid install mode in {target_id}")
+    if artifact.get("install_mode") == "NATIVE_BINARY_INSTALL":
+        archive_member = _required_text(
+            artifact.get("archive_member"),
+            f"binary archive member in {target_id}",
+        )
+        if not _is_safe_relative_path(archive_member) or not archive_member.casefold().endswith(".dll"):
+            raise WizardManifestError(f"invalid binary archive member in {target_id}")
+        for candidate in _as_list(artifact.get("archive_member_candidates")):
+            if not isinstance(candidate, str):
+                raise WizardManifestError(f"invalid binary archive member in {target_id}")
+            if not _is_safe_relative_path(candidate) or not candidate.casefold().endswith(".dll"):
+                raise WizardManifestError(f"invalid binary archive member in {target_id}")
+        target_paths = [
+            item for item in _as_list(artifact.get("provides")) if isinstance(item, str)
+        ]
+        if not any(
+            _normalize_target(item).startswith("skse/plugins/")
+            and _normalize_target(item).endswith(".dll")
+            for item in target_paths
+        ):
+            raise WizardManifestError(f"invalid binary target path in {target_id}")
     if artifact.get("install_mode") != "BUNDLE_DSD":
         if _positive_int(artifact.get("translation_nexus_mod_id")) is None:
             raise WizardManifestError(f"artifact has no Nexus mod id in {target_id}")
@@ -618,6 +638,16 @@ def _normalize_target(value: object) -> str:
         for part in str(value or "").replace("\\", "/").strip("/").casefold().split("/")
         if part
     )
+
+
+def _is_safe_relative_path(value: object) -> bool:
+    text = str(value or "").replace("\\", "/").strip()
+    if not text or text.startswith(("/", "//")):
+        return False
+    if len(text) >= 2 and text[1] == ":":
+        return False
+    parts = [part for part in text.split("/") if part not in {"", "."}]
+    return bool(parts) and all(part != ".." for part in parts)
 
 
 def _canonical_bytes(value: object) -> bytes:

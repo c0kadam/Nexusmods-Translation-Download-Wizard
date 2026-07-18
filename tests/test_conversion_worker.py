@@ -3,6 +3,8 @@ import subprocess
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 from modlist_translation_wizard import conversion_worker
 
 
@@ -153,6 +155,7 @@ def test_worker_does_not_recover_stale_result_after_failed_run(
         "_worker_command",
         lambda config_path: ["worker.exe", str(config_path)],
     )
+    monkeypatch.setattr(conversion_worker.time, "sleep", lambda _seconds: None)
 
     try:
         conversion_worker.run_conversion_in_worker(
@@ -169,3 +172,111 @@ def test_worker_does_not_recover_stale_result_after_failed_run(
         pass
     else:
         raise AssertionError("stale result should not be accepted")
+
+
+def test_worker_retries_once_after_unreported_process_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    result = object()
+    calls = 0
+
+    def fake_run_hidden_worker(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(args, 3, b"", b"")
+        config = json.loads(Path(args[-1]).read_text(encoding="utf-8"))
+        Path(config["status_path"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": "mtw-conversion-worker-status.v1",
+                    "ok": True,
+                    "result_path": str(tmp_path / "result.json"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+    monkeypatch.setattr(conversion_worker, "_run_hidden_worker", fake_run_hidden_worker)
+    monkeypatch.setattr(
+        conversion_worker,
+        "_worker_command",
+        lambda config_path: ["worker.exe", str(config_path)],
+    )
+    monkeypatch.setattr(conversion_worker, "load_wizard_conversion_result", lambda _path: result)
+    monkeypatch.setattr(conversion_worker.time, "sleep", lambda _seconds: None)
+
+    loaded = conversion_worker.run_conversion_in_worker(
+        manifest_path=tmp_path / "manifest.json",
+        profile_scan_path=tmp_path / "profile.json",
+        decisions_path=tmp_path / "decisions.json",
+        download_queue_path=tmp_path / "queue.json",
+        out_dir=tmp_path / "runtime",
+        staging_root=tmp_path / "mods",
+        output_mod_name_override="LoreRim - Turkce Ceviri",
+        allow_profile_drift=True,
+    )
+
+    diagnostics = json.loads(
+        (tmp_path / "runtime" / "conversion-worker" / "last_failed_worker.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert loaded is result
+    assert calls == 2
+    assert diagnostics["attempt"] == 1
+    assert diagnostics["returncode"] == 3
+    assert diagnostics["retryable"] is True
+
+
+def test_worker_does_not_retry_reported_conversion_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = 0
+
+    def fake_run_hidden_worker(args: list[str]) -> subprocess.CompletedProcess[bytes]:
+        nonlocal calls
+        calls += 1
+        config = json.loads(Path(args[-1]).read_text(encoding="utf-8"))
+        Path(config["status_path"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": "mtw-conversion-worker-status.v1",
+                    "ok": False,
+                    "error_type": "PermissionError",
+                    "error": "output is locked",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args, 1, b"", b"")
+
+    monkeypatch.setattr(conversion_worker, "_run_hidden_worker", fake_run_hidden_worker)
+    monkeypatch.setattr(
+        conversion_worker,
+        "_worker_command",
+        lambda config_path: ["worker.exe", str(config_path)],
+    )
+
+    with pytest.raises(RuntimeError, match="Deneme: 1/2"):
+        conversion_worker.run_conversion_in_worker(
+            manifest_path=tmp_path / "manifest.json",
+            profile_scan_path=tmp_path / "profile.json",
+            decisions_path=tmp_path / "decisions.json",
+            download_queue_path=tmp_path / "queue.json",
+            out_dir=tmp_path / "runtime",
+            staging_root=tmp_path / "mods",
+            output_mod_name_override="LoreRim - Turkce Ceviri",
+            allow_profile_drift=True,
+        )
+
+    diagnostics = json.loads(
+        (tmp_path / "runtime" / "conversion-worker" / "last_failed_worker.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert calls == 1
+    assert diagnostics["retryable"] is False

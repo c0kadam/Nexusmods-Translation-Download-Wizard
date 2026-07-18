@@ -29,6 +29,135 @@ src/modlist_translation_wizard/resources/releases/<release-id>/
   icon.ico
 ```
 
+## Branding
+
+`branding.json`, release adını ve banner görünümünü belirler:
+
+```json
+{
+  "display_name": "Example List Türkçe Çeviri Aracı",
+  "subtitle": "Example List için hazırlanmış çeviri paketi",
+  "banner": "banner.png",
+  "icon": "icon.ico",
+  "accent_color": "#2F5F73",
+  "font_color": "#C8D0D3",
+  "font_shadow": "#0B1116",
+  "warm_glow": "#8A3F1B"
+}
+```
+
+Renkler yalnızca `#RRGGBB` biçiminde kabul edilir. Geçersiz veya eksik değerler
+güvenli varsayılan renklere döner. `accent_color` banner zeminini,
+`font_color` banner metnini, `font_shadow` başlık gölgesini ve seçili görünüm
+düğmesini, `warm_glow` ise banner çerçevesiyle vurgu durumlarını belirler.
+
+## Uzaktan Manifest Kanalı
+
+Manifesti her uygulama build'inde yeniden paketlemek istemiyorsanız release klasörüne
+`remote_manifest.json` ekleyebilirsiniz. Bu dosya aracın açılışta GitHub gibi güvenilir
+bir kaynaktan güncel manifest listesini kontrol etmesini sağlar.
+
+Örnek `remote_manifest.json`:
+
+```json
+{
+  "schema_version": "mtw-remote-manifest-config.v1",
+  "enabled": true,
+  "list_id": "example-list",
+  "remote_list_id": "ExampleList",
+  "channel": "stable",
+  "repository": "c0kadam/NTDW-TranslationMAPS",
+  "branch": "main",
+  "index_path": "{remote_list_id}/{channel}/index.json",
+  "allow_hosts": ["raw.githubusercontent.com"],
+  "cache_ttl_seconds": 0,
+  "timeout_seconds": 8,
+  "allow_stale_cache": false
+}
+```
+
+Bu ayar varsa GUI iki kaynak modu sunar:
+
+- `OTA (Güncel)`: Her uygulama oturumunda uzak kanaldan yeni indeks ve manifest
+  indirir. Güncel veri alınamazsa önbelleğe veya yerel manifeste sessiz geçiş yapmaz.
+- `Yerel`: Hiçbir manifest ağ isteği yapmadan release içindeki manifesti veya
+  uygulamaya gömülü manifesti kullanır. Bu moda geçildiğinde OTA önbelleği temizlenir.
+
+İndirilen OTA manifesti yalnızca açık uygulama oturumunda kullanılır. Uygulama normal
+şekilde kapatıldığında önbellek silinir; sonraki açılışta manifest yeniden indirilir.
+
+Kaynak değiştirildiğinde eski profil kontrolü ve indirme durumu sıfırlanır. Seçili
+profil yeni manifest ile yeniden doğrulanır. İndirme planına yazılan çalışma manifesti,
+GUI'de gösterilen manifestin birebir doğrulanmış kopyasıdır.
+
+Standalone çıktıda `release/` kullanıcıya açık tek release klasörüdür. Tam manifest,
+hash, branding ve OTA ayarı burada bulunur. `modlist_translation_wizard/` klasörü
+Nuitka çalışma zamanı dosyalarıdır; kullanıcı tarafından değiştirilmemelidir. Dahili
+tarafta yalnızca release kimliği ve OTA bağlantısı için küçük bootstrap ayarları tutulur,
+ikinci bir tam manifest kopyası oluşturulmaz.
+
+Önerilen remote repo yapısı:
+
+```text
+Lorerim/
+  index.json
+  stable/
+    manifest.json
+    manifest.json.sha256
+    changelog.md
+NordicSouls/
+  index.json
+  stable/
+    manifest.json
+    manifest.json.sha256
+    changelog.md
+```
+
+Bu yapıda her mod listesinin kendi `index.json` dosyası vardır. LoreRim için araç
+şu dosyayı okur:
+
+```text
+https://raw.githubusercontent.com/c0kadam/NTDW-TranslationMAPS/main/Lorerim/index.json
+```
+
+`Lorerim/index.json` örneği:
+
+```json
+{
+  "schema_version": "mtw-remote-manifest-index.v1",
+  "list_id": "lorerim",
+  "manifest": {
+      "channel": "stable",
+      "version": "2026-07-15",
+      "url": "https://raw.githubusercontent.com/c0kadam/NTDW-TranslationMAPS/main/Lorerim/stable/manifest.json",
+      "sha256": "<manifest.json sha256>",
+      "min_app_version": "0.1.0"
+  }
+}
+```
+
+Bir mod listesi için birden fazla kanal gerekiyorsa `manifest` yerine `manifests`
+listesi de kullanılabilir.
+
+Güvenlik kuralları:
+
+- Remote URL'ler HTTPS olmalıdır.
+- Manifest URL host'u `allow_hosts` içinde olmalıdır.
+- İndirilen manifest SHA-256 ile doğrulanır.
+- Manifest şeması normal yerel manifest gibi doğrulanır.
+- Remote içerik kod olarak çalıştırılmaz; sadece JSON veri olarak okunur.
+- Nexus dosyaları yine manifestteki `file_id`, boyut ve hash bilgilerine göre işlenir.
+
+Ek paketi güncellediğinizde önerilen akış:
+
+1. NexusMods'a yeni dosyayı yükleyin.
+2. Yeni `file_id`, dosya boyutu ve SHA-256 değerini manifestte güncelleyin.
+3. Manifestin `version` bilgisini artırın.
+4. `manifest.json.sha256` ve remote `index.json` içindeki SHA-256 değerini yenileyin.
+5. Remote repo'yu güncelleyin.
+
+Bu akışta kullanıcı yeni exe indirmek zorunda kalmadan güncel manifesti alabilir.
+
 İsteğe bağlı olarak release içine yerel kaynaklar eklenebilir:
 
 ```text

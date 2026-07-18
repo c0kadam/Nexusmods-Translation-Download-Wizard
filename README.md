@@ -79,6 +79,19 @@ powershell -ExecutionPolicy Bypass -File scripts\build_standalone.ps1 `
 Bu aracı kendi mod listeniz için paketlemek istiyorsanız kısa başlangıç rehberi:
 [docs/creating-a-release.md](docs/creating-a-release.md)
 
+Release paketleri istenirse remote manifest kanalıyla da dağıtılabilir. Bu modelde
+GUI'deki `OTA (Güncel)` seçeneği `NTDW-TranslationMAPS` gibi bir manifest deposundan
+doğrulanmış güncel listeyi alır. `Yerel` seçeneği ağ isteği yapmadan release içindeki
+manifesti kullanır. OTA seçiliyken liste her uygulama açılışında yeniden indirilir;
+önbelleğe veya yerel manifeste sessiz geçiş yapılmaz. Oturumluk OTA önbelleği uygulama
+kapanınca silinir. Ayrıntılar aynı rehberdeki `Uzaktan Manifest Kanalı` bölümündedir.
+
+Standalone pakette kullanıcıya açık release verileri yalnızca `release/` klasöründedir.
+Yanındaki `modlist_translation_wizard/` klasörü derlenmiş uygulamanın çalışma zamanı
+dosyalarını içerir ve düzenlenmemelidir. Yerel manifest ile OTA birlikte kullanılamazsa
+uygulama kapanmak yerine kaynak kurtarma ekranını açar ve kaynak seçimini kullanıcıya
+bırakır.
+
 ## Notlar
 
 - MO2 profiliniz ve `modlist.txt` otomatik değiştirilmez.

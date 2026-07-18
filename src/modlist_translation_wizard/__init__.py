@@ -9,6 +9,7 @@ from modlist_translation_wizard.manifest import (
     load_wizard_manifest,
 )
 from modlist_translation_wizard.bundled import (
+    default_manifest_source_info,
     load_bundled_manifest,
     load_default_bundled_manifest,
 )
@@ -77,6 +78,7 @@ __all__ = [
     "convert_downloaded_translations_from_manifest",
     "clear_api_key",
     "create_sso_handshake",
+    "default_manifest_source_info",
     "export_wizard_manifest",
     "load_bundled_manifest",
     "load_default_bundled_manifest",

@@ -3,6 +3,7 @@ import json
 from modlist_translation_wizard.gui_model import (
     NON_PREMIUM_DELIVERY_LABEL,
     NEXUS_API_KEYS_URL,
+    api_key_notice,
     discover_mo2_profiles,
     delivery_mode_options,
     delivery_mode_value,
@@ -47,6 +48,16 @@ def test_manifest_summary_uses_manifest_metadata() -> None:
     assert summary["unique_download_count"] == "2"
     assert summary["add_on_package_count"] == "0"
     assert summary["registered_app_id"] == "modlist-translation-wizard"
+    assert summary["manifest_updated_at"] == "2026-06-25 00:00 UTC"
+
+
+def test_manifest_summary_prefers_explicit_update_timestamp() -> None:
+    manifest = _manifest()
+    manifest["updated_at"] = "2026-07-17T14:35:00+00:00"
+
+    summary = manifest_summary(manifest)
+
+    assert summary["manifest_updated_at"] == "2026-07-17 14:35 UTC"
 
 
 def test_manifest_summary_counts_add_on_packages() -> None:
@@ -91,6 +102,9 @@ def test_release_branding_loads_external_release_assets(tmp_path, monkeypatch) -
                 "subtitle": "External subtitle",
                 "banner": "banner.png",
                 "accent_color": "#123456",
+                "font_color": "#ABCDEF",
+                "font_shadow": "#010203",
+                "warm_glow": "#A04020",
             }
         ),
         encoding="utf-8",
@@ -102,7 +116,34 @@ def test_release_branding_loads_external_release_assets(tmp_path, monkeypatch) -
 
     assert branding.display_name == "External Release"
     assert branding.accent_color == "#123456"
+    assert branding.font_color == "#ABCDEF"
+    assert branding.font_shadow == "#010203"
+    assert branding.warm_glow == "#A04020"
     assert release_branding_asset_bytes(_manifest(), branding.banner) == b"external-banner"
+
+
+def test_release_branding_rejects_invalid_color_values(tmp_path, monkeypatch) -> None:
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    (release_dir / "branding.json").write_text(
+        json.dumps(
+            {
+                "accent_color": "red; invalid",
+                "font_color": "#12345",
+                "font_shadow": None,
+                "warm_glow": "#GGGGGG",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MTW_RELEASE_DIR", str(release_dir))
+
+    branding = load_release_branding(_manifest())
+
+    assert branding.accent_color == "#7C8F67"
+    assert branding.font_color == "#FFFFFF"
+    assert branding.font_shadow == "#28150C"
+    assert branding.warm_glow == "#8A5030"
 
 
 def test_release_branding_asset_path_prefers_external_release_icon(tmp_path, monkeypatch) -> None:
@@ -130,10 +171,26 @@ def test_auth_controls_hide_sso_and_expose_api_settings_link() -> None:
     controls = visible_auth_controls()
 
     assert controls["api_key"] is True
+    assert controls["api_key_clear"] is True
     assert controls["api_key_settings_link"] is True
     assert controls["sso"] is False
     assert controls["registered_app_id"] is False
     assert NEXUS_API_KEYS_URL == "https://www.nexusmods.com/settings/api-keys"
+
+
+def test_api_key_notice_warns_without_changing_delivery_mode() -> None:
+    assert api_key_notice(has_api_key=True, delivery_mode="PREMIUM_API") == (
+        "API anahtarı hazır.",
+        "success",
+    )
+    assert api_key_notice(has_api_key=False, delivery_mode="PREMIUM_API") == (
+        "Premium indirme için Nexus API anahtarı gerekli.",
+        "warning",
+    )
+    assert api_key_notice(has_api_key=False, delivery_mode="NON_PREMIUM_NXM") == (
+        "Ücretsiz / Tarayıcı indirmesinde API anahtarı gerekmez.",
+        "muted",
+    )
 
 
 def test_delivery_mode_labels_are_end_user_facing() -> None:
@@ -190,6 +247,17 @@ def test_preflight_summary_and_installer_button_states() -> None:
     )
     assert missing_api.can_download is False
     assert missing_api.download_hint == "Nexus API anahtarı kaydedilmeli."
+
+    non_premium_without_api = installer_button_state(
+        preflight_ready=True,
+        has_api_key=False,
+        has_download_plan=False,
+        downloads_complete=False,
+        conversion_complete=False,
+        delivery_mode="NON_PREMIUM_NXM",
+    )
+    assert non_premium_without_api.can_download is True
+    assert "Slow Download" in non_premium_without_api.download_hint
 
     ready = installer_button_state(
         preflight_ready=True,
