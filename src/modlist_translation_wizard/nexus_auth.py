@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, Iterator
 from urllib.parse import urlencode
 
+from modlist_translate_tool.nexus.api_client import NexusApiClient, NexusApiResponse
+
 from modlist_translation_wizard.credential_store import CredentialStore
 from modlist_translation_wizard.version import TOOL_NAME, __version__
 
@@ -21,6 +23,10 @@ DEFAULT_NEXUS_API_KEY_ENV = "NEXUS_API_KEY"
 
 class NexusAuthError(ValueError):
     """Raised when Nexus authentication setup is invalid."""
+
+
+class NexusPremiumRequiredError(NexusAuthError):
+    """Raised when a Premium-only operation is requested with a non-Premium account."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +169,24 @@ def clear_api_key(store: CredentialStore, *, app_id: str) -> NexusAuthStatus:
     return NexusAuthStatus(target=target, mode="missing", has_api_key=False)
 
 
+def require_premium_api_key(
+    api_key: str,
+    *,
+    client_factory: Callable[[str], NexusApiClient] | None = None,
+) -> NexusApiResponse:
+    key = _required_api_key(api_key)
+    factory = client_factory or (lambda value: NexusApiClient(value))
+    response = factory(key).validate()
+    payload = response.payload
+    if isinstance(payload, dict) and _is_known_false(payload.get("is_premium")):
+        raise NexusPremiumRequiredError(
+            "Bu Nexus API anahtarı Premium hesapla ilişkili görünmüyor.\n\n"
+            "Premium indirme için Nexus Premium gerekir. Premium üyeliğiniz yoksa "
+            "'Ücretsiz / Tarayıcı' indirme yöntemini seçin."
+        )
+    return response
+
+
 @contextmanager
 def temporary_nexus_api_key_env(
     api_key: str | None,
@@ -209,6 +233,13 @@ def _required_api_key(value: str | None) -> str:
     if any(character.isspace() for character in text):
         raise NexusAuthError("Nexus API key must not contain whitespace.")
     return text
+
+
+def _is_known_false(value: object) -> bool:
+    if isinstance(value, bool):
+        return value is False
+    text = str(value).strip().casefold()
+    return text in {"false", "0", "no", "hayir", "hayır"}
 
 
 def _session_id(value: str | None) -> str:

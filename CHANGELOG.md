@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Added API key removal, Premium account validation, application-data access, and
+  user-controlled Windows long-path support.
+- Improved browser-assisted download error reporting and conversion coverage for active
+  profile plugins.
+- Added c0kadam and Negatrm Discord support links to the installer.
+- Updated the bundled LoreRim add-on package reference.
+
 ## 0.2.0 - 2026-07-18
 
 - Added Nordic Souls as a packaged release alongside LoreRim.

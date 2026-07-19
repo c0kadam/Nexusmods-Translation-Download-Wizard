@@ -25,5 +25,5 @@ def test_release_manifest_safety_rejects_secret_like_fields() -> None:
 def test_release_manifest_safety_rejects_local_absolute_paths() -> None:
     with pytest.raises(ValueError, match="local absolute path"):
         _assert_release_manifest_safe(
-            {"resources": {"local_dsd_sources": [{"path": r"C:\workBench\private"}]}}
+            {"resources": {"local_dsd_sources": [{"path": r"C:\PrivateData\curated"}]}}
         )

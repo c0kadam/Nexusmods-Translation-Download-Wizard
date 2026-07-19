@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from modlist_translate_tool.nexus.api_client import NexusApiResponse, NexusRateLimit
-import modlist_translation_wizard.non_premium as non_premium_module
-from modlist_translation_wizard.manifest import write_wizard_manifest
+from modlist_translate_tool.nexus.api_client import (
+    NexusApiResponse,
+    NexusRateLimit,
+)
+from modlist_translation_wizard.manifest import WizardManifestError, write_wizard_manifest
 from modlist_translation_wizard.non_premium import (
     NxmLinkError,
     failed_non_premium_downloads,
@@ -172,7 +174,7 @@ def test_non_premium_download_uses_nxm_authorization_without_persisting_it(
 
     result = run_non_premium_nxm_download(
         plan=plan,
-        api_key=None,
+        api_key="NON_PREMIUM_API_KEY",
         nxm_url=(
             "nxm://skyrimspecialedition/mods/333/files/444"
             f"?key={transient_secret}&expires=2000000000"
@@ -186,7 +188,7 @@ def test_non_premium_download_uses_nxm_authorization_without_persisting_it(
     assert result.result_payload["secrets_persisted"] is False
     assert result.updated_queue_payload["summary"]["downloaded"] == 1
     assert result.updated_queue_payload["summary"]["planned"] == 1
-    assert received_api_keys == [None]
+    assert received_api_keys == ["NON_PREMIUM_API_KEY"]
     assert "key=temporary-nxm-secret" in fake_client.download_link_path
     for path in tmp_path.rglob("*"):
         if path.is_file() and path.suffix.casefold() in {".json", ".md", ".queue"}:
@@ -195,29 +197,19 @@ def test_non_premium_download_uses_nxm_authorization_without_persisting_it(
             assert "2000000000" not in content
 
 
-def test_nxm_query_client_omits_personal_api_key_header(monkeypatch) -> None:
-    calls: list[tuple[str, bool]] = []
+def test_non_premium_download_requires_api_key(tmp_path) -> None:
+    plan = _non_premium_plan(tmp_path)
 
-    class PublicClientProbe:
-        def __init__(self, api_key: str) -> None:
-            assert api_key == "nxm-query-authorization-only"
-
-        def get_json_url(self, url: str, *, include_api_key: bool):
-            calls.append((url, include_api_key))
-            return NexusApiResponse(payload=[])
-
-    monkeypatch.setattr(non_premium_module, "NexusApiClient", PublicClientProbe)
-    client = non_premium_module._NxmQueryAuthorizationClient()
-
-    client.get_json("/games/skyrimspecialedition/download_link.json?key=temporary")
-
-    assert calls == [
-        (
-            "https://api.nexusmods.com/v1/games/skyrimspecialedition/"
-            "download_link.json?key=temporary",
-            False,
+    with pytest.raises(WizardManifestError, match="API key is required"):
+        run_non_premium_nxm_download(
+            plan=plan,
+            api_key=None,
+            nxm_url=(
+                "nxm://skyrimspecialedition/mods/333/files/444"
+                "?key=temporary-nxm-secret&expires=2000000000"
+            ),
+            now=1900000000,
         )
-    ]
 
 
 def test_non_premium_failed_download_leaves_queue_on_next_file(tmp_path) -> None:

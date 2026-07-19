@@ -716,6 +716,9 @@ def test_conversion_passes_manifest_local_dsd_sources(tmp_path, monkeypatch) -> 
 
     def fake_convert(**kwargs):
         captured["local_dsd_sources"] = kwargs["local_dsd_sources"]
+        captured["include_all_profile_translation_memory_aliases"] = kwargs[
+            "include_all_profile_translation_memory_aliases"
+        ]
         output_mod_path = Path(kwargs["output_root"]) / "LoreRim - Turkish DSD Output"
         output_mod_path.mkdir(parents=True)
         conversion_dir = Path(kwargs["out_dir"])
@@ -746,6 +749,7 @@ def test_conversion_passes_manifest_local_dsd_sources(tmp_path, monkeypatch) -> 
     )
 
     assert captured["local_dsd_sources"] == [local_source]
+    assert captured["include_all_profile_translation_memory_aliases"] is True
     assert result.result_payload["local_dsd_sources"] == [str(local_source)]
     assert result.conversion.manifest_path.name == "mtw_dsd_conversion_manifest.json"
     assert result.conversion.report_path.name == "mtw_dsd_conversion_report.md"

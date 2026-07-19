@@ -256,7 +256,7 @@ def api_key_notice(*, has_api_key: bool, delivery_mode: str) -> tuple[str, str]:
         return "API anahtarı hazır.", "success"
     if delivery_mode == "PREMIUM_API":
         return "Premium indirme için Nexus API anahtarı gerekli.", "warning"
-    return "Ücretsiz / Tarayıcı indirmesinde API anahtarı gerekmez.", "muted"
+    return "Ücretsiz / Tarayıcı indirmesi için Nexus API anahtarı gerekli.", "warning"
 
 
 def visible_auth_controls() -> dict[str, bool]:
@@ -341,7 +341,7 @@ def installer_button_state(
             prepare_hint="Tüm gerekli arşivler hazır olmadan başlatılamaz.",
             staging_only=not real_install_supported,
         )
-    if not has_api_key and delivery_mode == "PREMIUM_API":
+    if not has_api_key:
         return InstallerButtonState(
             can_download=False,
             can_prepare=False,
@@ -366,7 +366,7 @@ def installer_button_state(
             staging_only=not real_install_supported,
         )
     mode_hint = (
-        "Nexus sayfası açılacak; Slow Download'a tıklayın."
+        "Nexus sayfası açılacak; Slow Download bağlantısı API anahtarıyla işlenecek."
         if delivery_mode == "NON_PREMIUM_NXM"
         else "Gerekli dosyalar Nexus API ile indirilecek."
     )
@@ -431,7 +431,7 @@ def primary_action_label(
         return "Tamamlandı"
     if downloads_complete:
         return "Çeviriyi hazırla"
-    if not has_api_key and delivery_mode == "PREMIUM_API":
+    if not has_api_key:
         return "API Gerekli"
     if has_download_plan:
         if delivery_mode == "NON_PREMIUM_NXM":

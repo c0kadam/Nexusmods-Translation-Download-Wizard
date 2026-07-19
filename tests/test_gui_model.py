@@ -4,6 +4,7 @@ from modlist_translation_wizard.gui_model import (
     NON_PREMIUM_DELIVERY_LABEL,
     NEXUS_API_KEYS_URL,
     api_key_notice,
+    default_workspace_root,
     discover_mo2_profiles,
     delivery_mode_options,
     delivery_mode_value,
@@ -38,6 +39,12 @@ def test_run_workspace_for_manifest_is_manifest_specific(tmp_path) -> None:
     workspace = run_workspace_for_manifest(_manifest(), tmp_path)
 
     assert workspace == tmp_path / "runs" / "lorerim" / "lorerim-tr-stable"
+
+
+def test_default_workspace_root_uses_local_app_data(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert default_workspace_root() == tmp_path / "Modlist Translation Wizard"
 
 
 def test_manifest_summary_uses_manifest_metadata() -> None:
@@ -188,8 +195,8 @@ def test_api_key_notice_warns_without_changing_delivery_mode() -> None:
         "warning",
     )
     assert api_key_notice(has_api_key=False, delivery_mode="NON_PREMIUM_NXM") == (
-        "Ücretsiz / Tarayıcı indirmesinde API anahtarı gerekmez.",
-        "muted",
+        "Ücretsiz / Tarayıcı indirmesi için Nexus API anahtarı gerekli.",
+        "warning",
     )
 
 
@@ -256,8 +263,8 @@ def test_preflight_summary_and_installer_button_states() -> None:
         conversion_complete=False,
         delivery_mode="NON_PREMIUM_NXM",
     )
-    assert non_premium_without_api.can_download is True
-    assert "Slow Download" in non_premium_without_api.download_hint
+    assert non_premium_without_api.can_download is False
+    assert non_premium_without_api.download_hint == "Nexus API anahtarı kaydedilmeli."
 
     ready = installer_button_state(
         preflight_ready=True,

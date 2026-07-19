@@ -16,6 +16,7 @@ from modlist_translate_tool.archives.archive_index import _resolve_7z
 from modlist_translate_tool.archives.safe_paths import (
     UnsafeArchivePathError,
     ensure_inside,
+    filesystem_io_path,
     normalize_archive_member_path,
 )
 from modlist_translate_tool.archives.safe_extractor import (
@@ -419,6 +420,9 @@ def convert_downloaded_translations_from_manifest(
         "mark_review_outputs": manifest.get("channel") == "extended",
         "output_mod_name_override": output_name_override,
         "progress_status_path": progress_status_path,
+        "include_all_profile_translation_memory_aliases": (
+            _include_all_profile_translation_memory_aliases(manifest)
+        ),
     }
     _write_conversion_progress(progress_status_path, "running_archive_conversion")
     conversion = _publish_conversion_outputs_for_mtw(
@@ -1255,7 +1259,8 @@ def _extract_native_binary_asset(
     except (KeyError, UnsafeArchivePathError, ValueError) as exc:
         return _native_binary_failure(asset, archive_path, "invalid_binary_asset_path", str(exc))
 
-    if target_path.exists() and not overwrite:
+    io_target_path = filesystem_io_path(target_path)
+    if io_target_path.exists() and not overwrite:
         return _native_binary_failure(
             asset,
             archive_path,
@@ -1278,7 +1283,7 @@ def _extract_native_binary_asset(
                 last_exc = None
                 break
             except (OSError, zipfile.BadZipFile, KeyError, ValueError) as exc:
-                target_path.unlink(missing_ok=True)
+                io_target_path.unlink(missing_ok=True)
                 last_exc = exc
         if last_exc is not None:
             return _native_binary_failure(
@@ -1312,7 +1317,7 @@ def _extract_native_binary_asset(
                 last_exc = None
                 break
             except (OSError, SevenZipCommandError, ValueError) as exc:
-                target_path.unlink(missing_ok=True)
+                io_target_path.unlink(missing_ok=True)
                 last_exc = exc
         if last_exc is not None:
             return _native_binary_failure(
@@ -1331,9 +1336,9 @@ def _extract_native_binary_asset(
             output_path=target_path,
         )
 
-    size = target_path.stat().st_size
+    size = io_target_path.stat().st_size
     if size <= 0:
-        target_path.unlink(missing_ok=True)
+        io_target_path.unlink(missing_ok=True)
         return _native_binary_failure(
             asset,
             archive_path,
@@ -1342,7 +1347,7 @@ def _extract_native_binary_asset(
             output_path=target_path,
         )
     if size > _NATIVE_BINARY_MAX_BYTES:
-        target_path.unlink(missing_ok=True)
+        io_target_path.unlink(missing_ok=True)
         return _native_binary_failure(
             asset,
             archive_path,
@@ -1354,7 +1359,7 @@ def _extract_native_binary_asset(
     sha256 = _file_sha256(target_path)
     expected_file_sha256 = str(asset.get("expected_file_sha256") or "").strip().casefold()
     if expected_file_sha256 and sha256 != expected_file_sha256:
-        target_path.unlink(missing_ok=True)
+        io_target_path.unlink(missing_ok=True)
         return _native_binary_failure(
             asset,
             archive_path,
@@ -1392,15 +1397,17 @@ def _extract_native_binary_from_zip(
             )
         if info.file_size <= 0:
             raise ValueError("extracted_member_empty")
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        io_target = filesystem_io_path(target_path)
+        io_target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target_path.with_name(f".{target_path.name}.mtw-tmp")
+        io_temporary = filesystem_io_path(temporary)
         try:
             with archive.open(info, "r") as source:
-                with temporary.open("wb") as destination:
+                with io_temporary.open("wb") as destination:
                     shutil.copyfileobj(source, destination)
-            temporary.replace(target_path)
+            io_temporary.replace(io_target)
         finally:
-            temporary.unlink(missing_ok=True)
+            io_temporary.unlink(missing_ok=True)
 
 
 def _zipinfo_is_symlink(info: zipfile.ZipInfo) -> bool:
@@ -1512,8 +1519,9 @@ def _cleanup_stale_native_binary_assets(
             continue
         try:
             path = _safe_manifest_output_path(output_mod_path, target_path)
-            if path.exists():
-                path.unlink()
+            io_path = filesystem_io_path(path)
+            if io_path.exists():
+                io_path.unlink()
                 status = "REMOVED"
             else:
                 status = "MISSING"
@@ -1650,15 +1658,16 @@ def _dedupe_strings(values: list[str]) -> list[str]:
 
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with filesystem_io_path(path).open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    io_path = filesystem_io_path(path)
+    io_path.parent.mkdir(parents=True, exist_ok=True)
+    io_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
@@ -1875,6 +1884,15 @@ def _manifest_script_context_alias_output_modes(
             mode = "disabled_review"
         result[plugin.casefold()] = mode
     return result
+
+
+def _include_all_profile_translation_memory_aliases(manifest: dict[str, Any]) -> bool:
+    resources = manifest.get("resources") if isinstance(manifest.get("resources"), dict) else {}
+    scope = str(
+        resources.get("profile_translation_memory_alias_scope")
+        or "all_profile_plugins"
+    ).strip().casefold()
+    return scope != "manifest_targets"
 
 
 def _manifest_native_owner_plugins(

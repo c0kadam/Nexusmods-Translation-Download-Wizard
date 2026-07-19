@@ -7,11 +7,13 @@ from modlist_translation_wizard.credential_store import MemoryCredentialStore
 from modlist_translation_wizard.manifest import write_wizard_manifest
 from modlist_translation_wizard.nexus_auth import (
     NexusAuthError,
+    NexusPremiumRequiredError,
     api_key_status,
     auth_report_payload,
     clear_api_key,
     create_sso_handshake,
     load_api_key,
+    require_premium_api_key,
     store_manual_api_key,
     temporary_nexus_api_key_env,
 )
@@ -80,6 +82,28 @@ def test_temporary_api_key_env_removes_key_when_no_previous_value(monkeypatch) -
     assert "NEXUS_API_KEY" not in os.environ
 
 
+def test_require_premium_api_key_rejects_non_premium_account() -> None:
+    with pytest.raises(NexusPremiumRequiredError, match="Premium hesap"):
+        require_premium_api_key(
+            "NON_PREMIUM_KEY",
+            client_factory=lambda _key: _FakeValidateClient({"is_premium": False}),
+        )
+
+
+def test_require_premium_api_key_accepts_premium_or_unknown_status() -> None:
+    premium = require_premium_api_key(
+        "PREMIUM_KEY",
+        client_factory=lambda _key: _FakeValidateClient({"is_premium": True}),
+    )
+    unknown = require_premium_api_key(
+        "UNKNOWN_KEY",
+        client_factory=lambda _key: _FakeValidateClient({"name": "LegacyResponse"}),
+    )
+
+    assert premium.payload["is_premium"] is True
+    assert unknown.payload["name"] == "LegacyResponse"
+
+
 def test_premium_plan_can_use_temporary_api_key_without_leaking_secret(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("NEXUS_API_KEY", raising=False)
     secret = "nxm_secret_value_456"
@@ -145,3 +169,13 @@ class _FakeNexusClient:
 
     def request_telemetry(self) -> dict[str, object]:
         return {"network_requests": 0, "cache_hits": 0}
+
+
+class _FakeValidateClient:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def validate(self):
+        from modlist_translate_tool.nexus.api_client import NexusApiResponse
+
+        return NexusApiResponse(payload=self.payload)

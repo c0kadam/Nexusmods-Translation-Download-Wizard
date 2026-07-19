@@ -43,6 +43,7 @@ from modlist_translation_wizard.gui_model import (
     PREMIUM_DELIVERY_LABEL,
     api_key_notice,
     api_settings_url,
+    default_workspace_root,
     delivery_mode_value,
     discover_mo2_profiles,
     estimated_remaining_seconds,
@@ -57,9 +58,11 @@ from modlist_translation_wizard.gui_model import (
     translation_output_mod_name,
 )
 from modlist_translation_wizard.nexus_auth import (
+    NexusPremiumRequiredError,
     api_key_status,
     clear_api_key,
     load_api_key,
+    require_premium_api_key,
     store_manual_api_key,
 )
 from modlist_translation_wizard.manifest import write_wizard_manifest
@@ -79,12 +82,20 @@ from modlist_translation_wizard.runtime import (
     plan_downloads_from_manifest,
     run_premium_downloads_from_plan,
 )
+from modlist_translation_wizard.windows_long_paths import (
+    WindowsLongPathEnableResult,
+    enable_windows_long_paths,
+    windows_long_path_status,
+)
 
 
 BANNER_IMAGE_MAX_WIDTH = 820
 BANNER_IMAGE_MAX_HEIGHT = 126
 BANNER_TEXT_COLUMN_WIDTH = 430
 BANNER_WINDOW_PADDING = 140
+C0KADAM_DISCORD_SUPPORT_URL = "https://discordapp.com/users/279006796524421130"
+NEGATRM_DISCORD_SUPPORT_URL = "https://discord.gg/4cHCUGkEP"
+ENDORSEMENT_MESSAGE = "Endorse etmeyi unutmayın, Esenlikler"
 
 
 def _banner_title_font_size(title: str) -> int:
@@ -96,6 +107,8 @@ def _banner_title_font_size(title: str) -> int:
     if length <= 48:
         return 18
     return 16
+
+
 DEFAULT_WINDOW_HEIGHT = 760
 MIN_WINDOW_WIDTH = 1040
 MAX_WINDOW_WIDTH = 1500
@@ -143,6 +156,7 @@ class ModlistTranslationInstallerApp:
         self.status_text = tk.StringVar(value="Hazır.")
         self.profile_status_text = tk.StringVar(value="Modlist klasörü seçin.")
         self.auth_status_text = tk.StringVar(value="Nexus API anahtarı kontrol ediliyor.")
+        self.long_paths_status_text = tk.StringVar(value="Windows ayarı kontrol ediliyor.")
         self.download_status_text = tk.StringVar(value="Profil hazırlanınca indirme açılır.")
         self.prepare_status_text = tk.StringVar(
             value="Çeviri hazırlanınca çıktı klasöründe oluşur."
@@ -167,6 +181,7 @@ class ModlistTranslationInstallerApp:
         self.premium_download_result: Any | None = None
         self.non_premium_download_result: Any | None = None
         self.conversion_result: Any | None = None
+        self.premium_api_validated = False
         self.pending_nxm_url: str | None = None
         self.nxm_capture_server: NxmCaptureServer | None = None
         self.nxm_protocol_binding = WindowsNxmProtocolBinding()
@@ -195,6 +210,7 @@ class ModlistTranslationInstallerApp:
 
         self._configure_style()
         self._build()
+        self._refresh_windows_long_paths_status()
         self._refresh_auth_status()
         self._refresh_pipeline_buttons()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
@@ -691,21 +707,69 @@ class ModlistTranslationInstallerApp:
             fg_color=self.colors["panel_alt"],
             border_color=self.colors["line"],
         ).grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
+        folder_actions = ctk.CTkFrame(main, fg_color="transparent")
+        folder_actions.grid(row=3, column=3, sticky="w", padx=(10, 18), pady=6)
         ctk.CTkButton(
-            main,
-            text="Klasörü aç",
+            folder_actions,
+            text="Çıktıyı aç",
             command=self._open_output_folder,
             corner_radius=8,
             fg_color=self.colors["button"],
             hover_color=self.colors["button_hover"],
-        ).grid(row=3, column=3, sticky="w", padx=(10, 18), pady=6)
+            width=104,
+        ).pack(side=tk.LEFT)
+        ctk.CTkButton(
+            folder_actions,
+            text="Uygulama verilerini aç",
+            command=self._open_app_data_folder,
+            corner_radius=8,
+            fg_color=self.colors["button"],
+            hover_color=self.colors["button_hover"],
+            width=166,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+        ctk.CTkLabel(
+            main,
+            text="Windows uzun yol desteği",
+            text_color=self.colors["text"],
+            anchor="w",
+        ).grid(row=4, column=0, sticky="w", padx=(18, 10), pady=(8, 6))
+        self.long_paths_status_label = ctk.CTkLabel(
+            main,
+            textvariable=self.long_paths_status_text,
+            text_color=self.colors["muted"],
+            anchor="w",
+        )
+        self.long_paths_status_label.grid(
+            row=4,
+            column=1,
+            columnspan=2,
+            sticky="w",
+            pady=(8, 6),
+        )
+        self.long_paths_button = ctk.CTkButton(
+            main,
+            text="Etkinleştir",
+            command=self._enable_windows_long_paths,
+            corner_radius=8,
+            fg_color=self.colors["button"],
+            hover_color=self.colors["button_hover"],
+            width=136,
+        )
+        self.long_paths_button.grid(
+            row=4,
+            column=3,
+            sticky="w",
+            padx=(10, 18),
+            pady=(8, 6),
+        )
 
         ctk.CTkLabel(
             main,
             text="Nexus API anahtarı",
             text_color=self.colors["text"],
             anchor="w",
-        ).grid(row=4, column=0, sticky="w", padx=(18, 10), pady=(12, 6))
+        ).grid(row=5, column=0, sticky="w", padx=(18, 10), pady=(12, 6))
         ctk.CTkEntry(
             main,
             textvariable=self.api_key,
@@ -713,10 +777,10 @@ class ModlistTranslationInstallerApp:
             corner_radius=8,
             fg_color=self.colors["panel_alt"],
             border_color=self.colors["line"],
-        ).grid(row=4, column=1, sticky="ew", pady=(12, 6))
+        ).grid(row=5, column=1, sticky="ew", pady=(12, 6))
         api_actions = ctk.CTkFrame(main, fg_color="transparent")
         api_actions.grid(
-            row=4,
+            row=5,
             column=2,
             columnspan=2,
             sticky="w",
@@ -759,7 +823,7 @@ class ModlistTranslationInstallerApp:
             anchor="w",
         )
         self.auth_status_label.grid(
-            row=5,
+            row=6,
             column=1,
             columnspan=3,
             sticky="w",
@@ -771,9 +835,9 @@ class ModlistTranslationInstallerApp:
             text="İndirme yöntemi",
             text_color=self.colors["text"],
             anchor="w",
-        ).grid(row=6, column=0, sticky="w", padx=(18, 10), pady=(12, 8))
+        ).grid(row=7, column=0, sticky="w", padx=(18, 10), pady=(12, 8))
         methods = ctk.CTkFrame(main, fg_color="transparent")
-        methods.grid(row=6, column=1, columnspan=3, sticky="w", pady=(12, 8))
+        methods.grid(row=7, column=1, columnspan=3, sticky="w", pady=(12, 8))
         ctk.CTkRadioButton(
             methods,
             text=PREMIUM_DELIVERY_LABEL,
@@ -816,9 +880,23 @@ class ModlistTranslationInstallerApp:
             anchor="w",
         )
         support.pack(side=tk.LEFT)
+        ctk.CTkButton(
+            methods,
+            text="/ Negatrm Discord",
+            command=self._open_negatrm_discord,
+            text_color=self.colors["link"],
+            cursor="hand2",
+            font=ctk.CTkFont(family="Segoe UI", size=13, underline=True),
+            fg_color="transparent",
+            hover_color=self.colors["panel_alt"],
+            corner_radius=7,
+            height=28,
+            width=142,
+            anchor="w",
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         self.nxm_frame = ctk.CTkFrame(main, fg_color="transparent")
-        self.nxm_frame.grid(row=7, column=0, columnspan=4, sticky="ew", padx=18, pady=(6, 16))
+        self.nxm_frame.grid(row=8, column=0, columnspan=4, sticky="ew", padx=18, pady=(6, 16))
         self.nxm_frame.columnconfigure(1, weight=1)
         ctk.CTkLabel(
             self.nxm_frame,
@@ -956,6 +1034,13 @@ class ModlistTranslationInstallerApp:
             font=ctk.CTkFont(family="Segoe UI", size=12),
         )
         self.prepare_status_label.grid(row=4, column=1, sticky="ew", padx=(8, 18), pady=(8, 16))
+        ctk.CTkLabel(
+            actions,
+            text=ENDORSEMENT_MESSAGE,
+            text_color=self.colors["premium"],
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            anchor="center",
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 14))
         self.details_frame = ctk.CTkFrame(actions, fg_color="transparent")
         self.details_frame.columnconfigure(0, weight=1)
         self.details_frame.rowconfigure(0, weight=1)
@@ -1124,6 +1209,7 @@ class ModlistTranslationInstallerApp:
             messagebox.showerror("API kaydedilemedi", str(exc))
             return
         self.api_key.set("")
+        self.premium_api_validated = False
         self._log("Nexus API anahtarı kaydedildi.")
         self._refresh_auth_status()
 
@@ -1144,6 +1230,7 @@ class ModlistTranslationInstallerApp:
             messagebox.showerror("API anahtarı silinemedi", str(exc))
             return
         self.api_key.set("")
+        self.premium_api_validated = False
         self._log("Kaydedilmiş Nexus API anahtarı silindi.")
         self._refresh_auth_status()
 
@@ -1151,7 +1238,10 @@ class ModlistTranslationInstallerApp:
         webbrowser.open(api_settings_url(), new=2, autoraise=True)
 
     def _open_discord_support(self) -> None:
-        webbrowser.open("https://discordapp.com/users/279006796524421130", new=2, autoraise=True)
+        webbrowser.open(C0KADAM_DISCORD_SUPPORT_URL, new=2, autoraise=True)
+
+    def _open_negatrm_discord(self) -> None:
+        webbrowser.open(NEGATRM_DISCORD_SUPPORT_URL, new=2, autoraise=True)
 
     @staticmethod
     def _load_discord_support_icon() -> ctk.CTkImage | None:
@@ -1182,6 +1272,70 @@ class ModlistTranslationInstallerApp:
             )
             return
         webbrowser.open(path.resolve().as_uri(), new=2, autoraise=True)
+
+    def _open_app_data_folder(self) -> None:
+        path = default_workspace_root()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(
+                "Uygulama verileri açılamadı",
+                f"Uygulama veri klasörü oluşturulamadı:\n{path}\n\n{exc}",
+            )
+            return
+        webbrowser.open(path.resolve().as_uri(), new=2, autoraise=True)
+
+    def _refresh_windows_long_paths_status(self) -> None:
+        status = windows_long_path_status()
+        if not status.available:
+            self.long_paths_status_text.set("Bu ayar yalnızca Windows üzerinde kullanılabilir.")
+            self.long_paths_status_label.configure(text_color=self.colors["muted"])
+            self.long_paths_button.configure(text="Kullanılamıyor", state=tk.DISABLED)
+            return
+        if status.enabled:
+            self.long_paths_status_text.set("Etkin. Uzun çıktı yolları destekleniyor.")
+            self.long_paths_status_label.configure(text_color=self.colors["success"])
+            self.long_paths_button.configure(text="Etkin", state=tk.DISABLED)
+            return
+        if status.error:
+            self.long_paths_status_text.set("Durum okunamadı; yönetici onayıyla yeniden deneyebilirsiniz.")
+        else:
+            self.long_paths_status_text.set("Kapalı. Uzun plugin adlarında dönüştürme durabilir.")
+        self.long_paths_status_label.configure(text_color=self.colors["warning"])
+        self.long_paths_button.configure(text="Etkinleştir", state=tk.NORMAL)
+
+    def _enable_windows_long_paths(self) -> None:
+        if windows_long_path_status().enabled:
+            self._refresh_windows_long_paths_status()
+            return
+        confirmed = messagebox.askyesno(
+            "Windows uzun yol desteği",
+            "Windows uzun yol desteği etkinleştirilsin mi?\n\n"
+            "Bu işlem LongPathsEnabled kayıt değerini 1 yapar ve Windows yönetici onayı ister. "
+            "Değişikliğin tüm uygulamalarda geçerli olması için bilgisayarı yeniden başlatmanız önerilir.",
+        )
+        if not confirmed:
+            return
+
+        def done(result: WindowsLongPathEnableResult) -> None:
+            self._refresh_windows_long_paths_status()
+            if result.cancelled:
+                self._set_status("Windows uzun yol ayarı değiştirilmedi.", "warning")
+                self._log("Windows uzun yol desteği için yönetici onayı verilmedi.")
+                return
+            self._set_status("Windows uzun yol desteği etkin.", "success")
+            self._log("Windows uzun yol desteği etkinleştirildi.")
+            messagebox.showinfo(
+                "Windows uzun yol desteği etkin",
+                "Uzun yol desteği etkinleştirildi.\n\n"
+                "Değişikliğin bütün uygulamalarda geçerli olması için bilgisayarı yeniden başlatmanız önerilir.",
+            )
+
+        self._run_task(
+            "Windows uzun yol desteği etkinleştiriliyor",
+            enable_windows_long_paths,
+            done,
+        )
 
     def _refresh_auth_status(self) -> None:
         try:
@@ -1251,7 +1405,7 @@ class ModlistTranslationInstallerApp:
             return
         if not self._ensure_profile_continue_confirmed():
             return
-        if self._delivery_mode_value() == "PREMIUM_API" and not self._api_key():
+        if not self._api_key():
             messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
             return
         if self.premium_plan_result is None:
@@ -1263,13 +1417,15 @@ class ModlistTranslationInstallerApp:
         if not self.profile_scan_path or not self._ensure_profile_continue_confirmed():
             return
         api_key = self._api_key()
-        if self._delivery_mode_value() == "PREMIUM_API" and not api_key:
+        if not api_key:
             messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
             return
         out_dir = self._run_workspace() / "runtime"
         download_dir = self._run_workspace() / "downloads"
 
         def work() -> Any:
+            if self._delivery_mode_value() == "PREMIUM_API":
+                self._ensure_premium_api_key(api_key)
             manifest_path = self._write_runtime_manifest()
             return plan_downloads_from_manifest(
                 manifest_path=manifest_path,
@@ -1311,16 +1467,17 @@ class ModlistTranslationInstallerApp:
         if self.premium_plan_result is None:
             self._plan_downloads(auto_start=True)
             return
-        if self._delivery_mode_value() == "NON_PREMIUM_NXM":
-            self._open_next_non_premium_page()
-            return
         api_key = self._api_key()
         if not api_key:
             messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
             return
+        if self._delivery_mode_value() == "NON_PREMIUM_NXM":
+            self._open_next_non_premium_page()
+            return
         queue_path = self._current_download_queue_path()
 
         def work() -> Any:
+            self._ensure_premium_api_key(api_key)
             download_total = self._eta_total
 
             def tracked_downloader(url: str, part_path: Path) -> int:
@@ -1378,9 +1535,18 @@ class ModlistTranslationInstallerApp:
         )
         self._run_task("Dosya indiriliyor", work, done)
 
+    def _ensure_premium_api_key(self, api_key: str) -> None:
+        if self.premium_api_validated:
+            return
+        require_premium_api_key(api_key)
+        self.premium_api_validated = True
+
     def _open_next_non_premium_page(self) -> None:
         if self.premium_plan_result is None:
             self._plan_downloads(auto_start=True)
+            return
+        if not self._api_key():
+            messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
             return
         queue_payload = json.loads(self._current_download_queue_path().read_text(encoding="utf-8"))
         item = next_non_premium_download(queue_payload)
@@ -1423,6 +1589,9 @@ class ModlistTranslationInstallerApp:
             messagebox.showwarning("İndirme hazır değil", "Önce indirme hazırlığı yapılmalı.")
             return
         api_key = self._api_key()
+        if not api_key:
+            messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
+            return
         nxm_url = self.nxm_link.get().strip()
         if not nxm_url:
             messagebox.showwarning(
@@ -1453,9 +1622,12 @@ class ModlistTranslationInstallerApp:
                 )
             else:
                 failed_label = self._first_non_premium_failure_label(result.updated_queue_payload)
+                failure_hint = self._first_non_premium_failure_hint(result.updated_queue_payload)
                 self.download_status_text.set(
-                f"Dosya indirilemedi: {failed_label or 'hata ayrıntısı detaylarda'}."
+                    f"Dosya indirilemedi: {failed_label or 'hata ayrıntısı detaylarda'}."
                 )
+                if failure_hint:
+                    self.nxm_status_text.set(failure_hint)
                 self._show_non_premium_failures(result.updated_queue_payload)
             if readiness["complete"]:
                 self._set_status("Tüm dosyalar hazır.", "success")
@@ -1889,6 +2061,7 @@ class ModlistTranslationInstallerApp:
         self.premium_download_result = None
         self.non_premium_download_result = None
         self.conversion_result = None
+        self.premium_api_validated = False
         self.pending_nxm_url = None
         self.nxm_link.set("")
         self.output_folder_text.set(self._output_folder_display())
@@ -1907,7 +2080,7 @@ class ModlistTranslationInstallerApp:
             return
         if self.premium_plan_result is None:
             self.nxm_status_text.set(
-                "Ücretsiz modda Nexus sayfası açılır; Slow Download'a tıklayınca Çeviri aracı linki yakalar."
+                "Ücretsiz modda Premium üyelik gerekmez; indirme için Nexus API anahtarı kaydedilmelidir."
             )
             return
         try:
@@ -1937,6 +2110,18 @@ class ModlistTranslationInstallerApp:
     def _first_non_premium_failure_label(self, queue_payload: dict[str, Any]) -> str:
         failed = failed_non_premium_downloads(queue_payload)
         return self._format_non_premium_item(failed[0]) if failed else ""
+
+    def _first_non_premium_failure_hint(self, queue_payload: dict[str, Any]) -> str:
+        failed = failed_non_premium_downloads(queue_payload)
+        if not failed:
+            return ""
+        last_error = str(failed[0].get("last_error") or "").strip()
+        if last_error == "nexus_api_http_401" and not self._api_key():
+            return (
+                "Nexus bu dosya için API anahtarı istiyor. API anahtarını kaydedip "
+                "aynı dosyayı tekrar deneyin."
+            )
+        return self._download_error_hint(last_error)
 
     def _show_non_premium_failures(
         self,
@@ -1973,6 +2158,15 @@ class ModlistTranslationInstallerApp:
             f"{label} "
             f"({item.get('translation_nexus_mod_id')}/{item.get('translation_file_id')})"
         )
+
+    def _download_error_hint(self, reason: str) -> str:
+        if reason == "nexus_api_http_401":
+            return "Nexus oturumu veya API yetkisi bu dosya için geçerli değil."
+        if reason.startswith("nexus_api_http_"):
+            return f"Nexus indirme isteği başarısız oldu: {reason}."
+        if reason:
+            return f"İndirme hatası: {reason}."
+        return ""
 
     def _delivery_mode_value(self) -> str:
         return delivery_mode_value(self.delivery_mode.get())
@@ -2088,9 +2282,18 @@ class ModlistTranslationInstallerApp:
             payload = {}
         converter_stage = str(payload.get("converter_stage") or payload.get("stage") or "")
         runtime_stage = str(payload.get("stage") or "")
+        alias_total = int(payload.get("total_alias_plugins") or 0)
+        alias_processed = int(payload.get("processed_alias_plugins") or 0)
         total = int(payload.get("total_archives") or 0)
         processed = int(payload.get("processed_archives") or 0)
-        if total > 0:
+        if alias_total > 0:
+            display_processed = max(1, min(alias_processed, alias_total))
+            self.eta_text.set("Profil eklentileri kontrol ediliyor")
+            self._set_progress(
+                max(int(self.progress_value.get()), 98),
+                f"Ek plugin çevirileri hazırlanıyor: {display_processed}/{alias_total}",
+            )
+        elif total > 0:
             display_processed = max(1, min(processed, total))
             completed_for_eta = max(0, min(display_processed - 1, total))
             label = f"Çeviri hazırlanıyor: {display_processed}/{total} arşiv"
@@ -2216,6 +2419,14 @@ class ModlistTranslationInstallerApp:
 
     def _handle_task_error(self, error: BaseException, traceback_text: str) -> None:
         self._stop_time_estimate()
+        if isinstance(error, NexusPremiumRequiredError):
+            self._set_status("Premium API gerekli.", "warning", prominent=True)
+            self.progress_label.set("Premium indirme başlatılmadı")
+            self.download_status_text.set(str(error).splitlines()[0])
+            self._log(f"Uyarı: {error}")
+            messagebox.showwarning("Premium gerekli", str(error))
+            self._refresh_pipeline_buttons()
+            return
         self._set_status("Hata oluştu.", "danger", prominent=True)
         self.progress_label.set("İşlem hata verdi")
         self._log(f"Hata: {error}")
@@ -2281,7 +2492,7 @@ class ModlistTranslationInstallerApp:
             self.details_button.configure(text="Detayları göster")
             self.details_visible.set(False)
             return
-        self.details_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        self.details_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         self.details_button.configure(text="Detayları gizle")
         self.details_visible.set(True)
 
