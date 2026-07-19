@@ -1,6 +1,6 @@
 from modlist_translation_wizard.installer_gui import (
     C0KADAM_DISCORD_SUPPORT_URL,
-    ENDORSEMENT_MESSAGE,
+    ENDORSE_BUTTON_LABEL,
     NEGATRM_DISCORD_SUPPORT_URL,
     _banner_title_font_size,
 )
@@ -20,5 +20,5 @@ def test_discord_support_links_use_expected_destinations() -> None:
     assert NEGATRM_DISCORD_SUPPORT_URL == "https://discord.gg/4cHCUGkEP"
 
 
-def test_endorsement_message_is_user_visible_turkish_copy() -> None:
-    assert ENDORSEMENT_MESSAGE == "Endorse etmeyi unutmayın, Esenlikler"
+def test_endorsement_button_uses_thumb_up_action_label() -> None:
+    assert ENDORSE_BUTTON_LABEL == "👍 Endorse Et"

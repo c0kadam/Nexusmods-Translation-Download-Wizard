@@ -7,6 +7,7 @@
 - Improved browser-assisted download error reporting and conversion coverage for active
   profile plugins.
 - Added c0kadam and Negatrm Discord support links to the installer.
+- Added a release-configured, user-initiated Nexus endorsement button.
 - Updated the bundled LoreRim add-on package reference.
 
 ## 0.2.0 - 2026-07-18

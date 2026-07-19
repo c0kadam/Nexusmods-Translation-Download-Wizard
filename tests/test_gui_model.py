@@ -96,6 +96,9 @@ def test_release_branding_loads_bundled_lorerim_defaults() -> None:
     assert branding.subtitle
     assert branding.accent_color == "#603415"
     assert branding.banner == "lorerim.png"
+    assert branding.endorsement is not None
+    assert branding.endorsement.game_domain == "skyrimspecialedition"
+    assert branding.endorsement.mod_id == 158770
     assert release_branding_asset_bytes(_manifest(), branding.banner)
 
 

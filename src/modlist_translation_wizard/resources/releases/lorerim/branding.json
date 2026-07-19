@@ -3,5 +3,11 @@
   "subtitle": "Skyrim LoreRim Mod Listesi Türkçe Yerelleştirme Aracı",
   "banner": "lorerim.png",
   "icon": "icon.ico",
-  "accent_color": "#603415"
+  "accent_color": "#603415",
+  "endorsement": {
+    "enabled": true,
+    "game_domain": "skyrimspecialedition",
+    "mod_id": 158770,
+    "label": "LoreRim Türkçe Çeviri Paketi"
+  }
 }

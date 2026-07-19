@@ -38,6 +38,11 @@ from modlist_translation_wizard.credential_store import (
     MemoryCredentialStore,
     WindowsCredentialStore,
 )
+from modlist_translation_wizard.endorsement import (
+    NexusEndorsementError,
+    NexusEndorsementResult,
+    endorse_release_translation,
+)
 from modlist_translation_wizard.gui_model import (
     NON_PREMIUM_DELIVERY_LABEL,
     PREMIUM_DELIVERY_LABEL,
@@ -95,7 +100,7 @@ BANNER_TEXT_COLUMN_WIDTH = 430
 BANNER_WINDOW_PADDING = 140
 C0KADAM_DISCORD_SUPPORT_URL = "https://discordapp.com/users/279006796524421130"
 NEGATRM_DISCORD_SUPPORT_URL = "https://discord.gg/4cHCUGkEP"
-ENDORSEMENT_MESSAGE = "Endorse etmeyi unutmayın, Esenlikler"
+ENDORSE_BUTTON_LABEL = "👍 Endorse Et"
 
 
 def _banner_title_font_size(title: str) -> int:
@@ -139,6 +144,7 @@ class ModlistTranslationInstallerApp:
         )
         self.summary = manifest_summary(self.manifest)
         self.branding = load_release_branding(self.manifest)
+        self.endorsement_target = self.branding.endorsement
         self.app_id = self.summary["registered_app_id"]
         self.store: CredentialStore = _create_credential_store()
         self.window_icon_photo: ImageTk.PhotoImage | None = None
@@ -173,6 +179,13 @@ class ModlistTranslationInstallerApp:
         self.release_summary_text = tk.StringVar(value=self._release_summary_display())
         source_text, _source_tone = self._manifest_source_notice()
         self.manifest_source_text = tk.StringVar(value=source_text)
+        self.endorsement_status_text = tk.StringVar(
+            value=(
+                "Çeviri sayfasını Nexus'ta destekleyin."
+                if self.endorsement_target is not None
+                else ""
+            )
+        )
 
         self.profile_scan_path: Path | None = None
         self.preflight_payload: dict[str, Any] | None = None
@@ -201,6 +214,7 @@ class ModlistTranslationInstallerApp:
         self._eta_status_path: Path | None = None
         self.banner_image: ctk.CTkImage | None = None
         self.discord_support_icon: ctk.CTkImage | None = None
+        self.endorsement_button: ctk.CTkButton | None = None
         self.completion_popup: ctk.CTkToplevel | None = None
 
         try:
@@ -407,13 +421,14 @@ class ModlistTranslationInstallerApp:
             border_color=self.colors["line"],
         )
         card.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 10))
-        card.columnconfigure(0, weight=3)
-        card.columnconfigure(1, weight=2, minsize=360)
+        card.columnconfigure(0, weight=1)
+        card.columnconfigure(1, weight=0, minsize=440)
         ctk.CTkLabel(
             card,
             textvariable=self.release_summary_text,
             text_color=self.colors["text"],
             anchor="w",
+            wraplength=600,
             font=ctk.CTkFont(family="Segoe UI", size=13),
         ).grid(row=0, column=0, sticky="ew", padx=(18, 12), pady=(14, 8))
 
@@ -469,10 +484,44 @@ class ModlistTranslationInstallerApp:
             text_color=self.colors[source_tone],
             anchor="w",
             justify="left",
-            wraplength=410,
+            wraplength=380,
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
         )
         self.manifest_source_label.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+        if self.endorsement_target is not None:
+            ctk.CTkFrame(
+                self.manifest_source_frame,
+                height=1,
+                fg_color=self.colors["line"],
+            ).grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 10))
+            endorsement_row = ctk.CTkFrame(
+                self.manifest_source_frame,
+                fg_color="transparent",
+            )
+            endorsement_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
+            endorsement_row.columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                endorsement_row,
+                textvariable=self.endorsement_status_text,
+                text_color=self.colors["text"],
+                anchor="w",
+                justify="left",
+                wraplength=220,
+                font=ctk.CTkFont(family="Segoe UI", size=12),
+            ).grid(row=0, column=0, sticky="ew", padx=(0, 10))
+            self.endorsement_button = ctk.CTkButton(
+                endorsement_row,
+                text=ENDORSE_BUTTON_LABEL,
+                command=self._endorse_release,
+                fg_color=self.colors["premium"],
+                hover_color="#ffad4d",
+                text_color=("#ffffff", "#ffffff"),
+                corner_radius=9,
+                height=38,
+                width=132,
+                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            )
+            self.endorsement_button.grid(row=0, column=1, sticky="e")
 
     def _log_manifest_source(self) -> None:
         info = self.manifest_source_info
@@ -1034,13 +1083,6 @@ class ModlistTranslationInstallerApp:
             font=ctk.CTkFont(family="Segoe UI", size=12),
         )
         self.prepare_status_label.grid(row=4, column=1, sticky="ew", padx=(8, 18), pady=(8, 16))
-        ctk.CTkLabel(
-            actions,
-            text=ENDORSEMENT_MESSAGE,
-            text_color=self.colors["premium"],
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            anchor="center",
-        ).grid(row=5, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 14))
         self.details_frame = ctk.CTkFrame(actions, fg_color="transparent")
         self.details_frame.columnconfigure(0, weight=1)
         self.details_frame.rowconfigure(0, weight=1)
@@ -1242,6 +1284,64 @@ class ModlistTranslationInstallerApp:
 
     def _open_negatrm_discord(self) -> None:
         webbrowser.open(NEGATRM_DISCORD_SUPPORT_URL, new=2, autoraise=True)
+
+    def _endorse_release(self) -> None:
+        target = self.endorsement_target
+        button = self.endorsement_button
+        if target is None or button is None:
+            return
+        if self.busy:
+            messagebox.showinfo("İşlem sürüyor", "Devam eden işlem tamamlandıktan sonra tekrar deneyin.")
+            return
+        api_key = self._api_key()
+        if not api_key:
+            messagebox.showwarning(
+                "API anahtarı gerekli",
+                "Endorse etmek için önce Nexus API anahtarınızı kaydedin.",
+            )
+            return
+
+        button.configure(text="Gönderiliyor...", state=tk.DISABLED)
+        self.endorsement_status_text.set("Nexus endorsement gönderiliyor...")
+
+        def work() -> dict[str, object]:
+            try:
+                return {"result": endorse_release_translation(api_key, target)}
+            except Exception as exc:  # noqa: BLE001 - converted to a user-facing GUI result.
+                return {"error": exc}
+
+        def done(payload: dict[str, object]) -> None:
+            result = payload.get("result")
+            if isinstance(result, NexusEndorsementResult):
+                button.configure(
+                    text="✓ Endorse Edildi",
+                    state=tk.DISABLED,
+                    fg_color=self.colors["success"],
+                    hover_color=self.colors["success"],
+                )
+                self.endorsement_status_text.set("Teşekkürler, endorsement Nexus'a gönderildi.")
+                self._log(
+                    f"Nexus endorsement tamamlandı: {target.game_domain}/{target.mod_id}."
+                )
+                return
+
+            error = payload.get("error")
+            message = (
+                str(error)
+                if isinstance(error, NexusEndorsementError)
+                else "Nexus endorse işlemi tamamlanamadı. Daha sonra tekrar deneyin."
+            )
+            button.configure(
+                text=ENDORSE_BUTTON_LABEL,
+                state=tk.NORMAL,
+                fg_color=self.colors["premium"],
+                hover_color="#ffad4d",
+            )
+            self.endorsement_status_text.set("Endorse gönderilemedi; tekrar deneyebilirsiniz.")
+            self._log(f"Nexus endorsement başarısız: {message}")
+            messagebox.showerror("Endorse işlemi başarısız", message)
+
+        self._run_task("Nexus endorsement gönderiliyor", work, done)
 
     @staticmethod
     def _load_discord_support_icon() -> ctk.CTkImage | None:
@@ -2492,7 +2592,7 @@ class ModlistTranslationInstallerApp:
             self.details_button.configure(text="Detayları göster")
             self.details_visible.set(False)
             return
-        self.details_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        self.details_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         self.details_button.configure(text="Detayları gizle")
         self.details_visible.set(True)
 

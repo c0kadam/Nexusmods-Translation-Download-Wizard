@@ -13,6 +13,10 @@ from typing import Any
 from importlib.resources import files
 
 from modlist_translation_wizard.bundled import external_release_dirs
+from modlist_translation_wizard.endorsement import (
+    ReleaseEndorsementTarget,
+    release_endorsement_target,
+)
 from modlist_translation_wizard.version import TOOL_NAME
 
 DEFAULT_BUNDLED_MANIFEST_LIST_ID = "lorerim"
@@ -33,6 +37,7 @@ class ReleaseBranding:
     warm_glow: str = "#8A5030"
     banner: str | None = None
     icon: str | None = None
+    endorsement: ReleaseEndorsementTarget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +165,9 @@ def _release_branding_from_json(
     payload = json.loads(path.read_text(encoding="utf-8"))
     banner = str(payload.get("banner") or "").strip() or None
     icon = str(payload.get("icon") or "").strip() or None
+    display_name = str(payload.get("display_name") or fallback_name)
     return ReleaseBranding(
-        display_name=str(payload.get("display_name") or fallback_name),
+        display_name=display_name,
         subtitle=str(payload.get("subtitle") or fallback_subtitle),
         accent_color=_branding_color(payload.get("accent_color"), "#7C8F67"),
         font_color=_branding_color(payload.get("font_color"), "#FFFFFF"),
@@ -169,6 +175,10 @@ def _release_branding_from_json(
         warm_glow=_branding_color(payload.get("warm_glow"), "#8A5030"),
         banner=banner,
         icon=icon,
+        endorsement=release_endorsement_target(
+            payload.get("endorsement"),
+            fallback_label=display_name,
+        ),
     )
 
 

@@ -42,7 +42,13 @@ src/modlist_translation_wizard/resources/releases/<release-id>/
   "accent_color": "#2F5F73",
   "font_color": "#C8D0D3",
   "font_shadow": "#0B1116",
-  "warm_glow": "#8A3F1B"
+  "warm_glow": "#8A3F1B",
+  "endorsement": {
+    "enabled": true,
+    "game_domain": "skyrimspecialedition",
+    "mod_id": 123456,
+    "label": "Example List Türkçe Çeviri Paketi"
+  }
 }
 ```
 
@@ -50,6 +56,12 @@ Renkler yalnızca `#RRGGBB` biçiminde kabul edilir. Geçersiz veya eksik değer
 güvenli varsayılan renklere döner. `accent_color` banner zeminini,
 `font_color` banner metnini, `font_shadow` başlık gölgesini ve seçili görünüm
 düğmesini, `warm_glow` ise banner çerçevesiyle vurgu durumlarını belirler.
+
+İsteğe bağlı `endorsement` alanı, GUI'nin sağ üst bölümünde yalnızca bu release'in
+çeviri sayfasını endorse eden bir düğme gösterir. `game_domain` Nexus oyun alanını,
+`mod_id` çeviri sayfasını, `label` ise kullanıcıya gösterilecek paket adını belirler.
+Alan kaldırılır veya `enabled` değeri `false` yapılırsa düğme gösterilmez. Araç
+unendorse ya da abstain isteği göndermez.
 
 ## Uzaktan Manifest Kanalı
 
