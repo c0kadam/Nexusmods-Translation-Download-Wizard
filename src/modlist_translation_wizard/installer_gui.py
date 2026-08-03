@@ -59,6 +59,7 @@ from modlist_translation_wizard.gui_model import (
     preflight_summary,
     release_branding_asset_bytes,
     release_branding_asset_path,
+    resolve_installer_mo2_location,
     run_workspace_for_manifest,
     translation_output_mod_name,
 )
@@ -1122,6 +1123,13 @@ class ModlistTranslationInstallerApp:
         self.mo2_profile.set(selected_profile)
         if hasattr(self.profile_combo, "set"):
             self.profile_combo.set(selected_profile)
+        self.output_folder_text.set(self._output_folder_display())
+        location = resolve_installer_mo2_location(root, selected_profile)
+        if location is not None:
+            self._log(
+                f"MO2 yapısı: {location.layout_kind}; veri kökü: {location.data_root}; "
+                f"mods: {location.mods_dir}."
+            )
         self._set_profile_status(
             f"{len(profiles)} profil bulundu. {selected_profile} kontrol ediliyor."
         )
@@ -1160,6 +1168,7 @@ class ModlistTranslationInstallerApp:
 
         def done(result: Any) -> None:
             self.profile_scan_path = result.json_path
+            self.output_folder_text.set(self._output_folder_display())
             summary = result.payload.get("summary", {})
             self._set_profile_status(
                 f"Profil okundu: {summary.get('enabled_mod_count', 0)} mod, "
@@ -2312,12 +2321,19 @@ class ModlistTranslationInstallerApp:
         return translation_output_mod_name(
             self.mo2_root.get().strip(),
             fallback_modlist_name=self.summary.get("modlist_name") or "Modlist",
+            profile_name=self.mo2_profile.get().strip() or None,
         )
 
     def _selected_mods_root(self) -> Path | None:
         root_text = self.mo2_root.get().strip()
         if not root_text:
             return None
+        location = resolve_installer_mo2_location(
+            root_text,
+            self.mo2_profile.get().strip() or None,
+        )
+        if location is not None:
+            return location.mods_dir
         return Path(root_text) / "mods"
 
     def _planned_output_folder(self) -> Path | None:

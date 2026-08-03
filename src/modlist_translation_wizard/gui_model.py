@@ -14,6 +14,10 @@ from importlib.resources import files
 from urllib.parse import urlparse
 
 from modlist_translation_wizard.bundled import external_release_dirs
+from modlist_translate_tool.mo2.layout import (
+    discover_mo2_layouts,
+    preferred_mo2_layout,
+)
 from modlist_translation_wizard.endorsement import (
     ReleaseEndorsementTarget,
     release_endorsement_target,
@@ -60,6 +64,17 @@ class InstallerButtonState:
     staging_only: bool
 
 
+@dataclass(frozen=True, slots=True)
+class InstallerMo2Location:
+    input_root: Path
+    data_root: Path
+    instance_root: Path
+    profiles_dir: Path
+    mods_dir: Path
+    display_name: str
+    layout_kind: str
+
+
 def default_workspace_root() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
@@ -76,15 +91,36 @@ def run_workspace_for_manifest(manifest: dict[str, Any], workspace_root: Path | 
 
 
 def discover_mo2_profiles(mo2_root: Path | str) -> list[str]:
-    profiles_dir = Path(mo2_root) / "profiles"
-    if not profiles_dir.is_dir():
+    try:
+        names: dict[str, str] = {}
+        for layout in discover_mo2_layouts(mo2_root):
+            for profile_dir in layout.profiles_dir.iterdir():
+                if profile_dir.is_dir() and (profile_dir / "modlist.txt").is_file():
+                    names.setdefault(profile_dir.name.casefold(), profile_dir.name)
+        return sorted(names.values(), key=str.casefold)
+    except (FileNotFoundError, NotADirectoryError, OSError, ValueError):
         return []
-    profiles = [
-        path.name
-        for path in profiles_dir.iterdir()
-        if path.is_dir() and (path / "modlist.txt").exists()
-    ]
-    return sorted(profiles, key=str.casefold)
+
+
+def resolve_installer_mo2_location(
+    mo2_root: Path | str,
+    profile_name: str | None = None,
+) -> InstallerMo2Location | None:
+    root_text = str(mo2_root or "").strip()
+    if not root_text:
+        return None
+    layout = preferred_mo2_layout(root_text, profile_name)
+    if layout is None:
+        return None
+    return InstallerMo2Location(
+        input_root=layout.input_root,
+        data_root=layout.data_root,
+        instance_root=layout.instance_root,
+        profiles_dir=layout.profiles_dir,
+        mods_dir=layout.mods_dir,
+        display_name=layout.display_name,
+        layout_kind=layout.layout_kind,
+    )
 
 
 def manifest_summary(manifest: dict[str, Any]) -> dict[str, str]:
@@ -432,14 +468,25 @@ def _prepare_label(real_install_supported: bool) -> str:
     return "Kuruluma başla" if real_install_supported else PREPARE_TRANSLATION_LABEL
 
 
-def smart_modlist_display_name(mo2_root: Path | str, fallback: str = "Modlist") -> str:
-    raw_name = Path(str(mo2_root or "").strip()).name.strip()
+def smart_modlist_display_name(
+    mo2_root: Path | str,
+    fallback: str = "Modlist",
+    *,
+    profile_name: str | None = None,
+) -> str:
+    location = resolve_installer_mo2_location(mo2_root, profile_name)
+    raw_name = (
+        location.display_name.strip()
+        if location is not None
+        else Path(str(mo2_root or "").strip()).name.strip()
+    )
     if not raw_name:
         return fallback
     compact_key = re.sub(r"[\s_-]+", "", raw_name).casefold()
     known = {
         "lorerim": "LoreRim",
         "nordicsouls": "Nordic Souls",
+        "nolvusawakening": "Nolvus Awakening",
     }
     if compact_key in known:
         return known[compact_key]
@@ -453,8 +500,14 @@ def smart_modlist_display_name(mo2_root: Path | str, fallback: str = "Modlist") 
 def translation_output_mod_name(
     mo2_root: Path | str,
     fallback_modlist_name: str = "Modlist",
+    *,
+    profile_name: str | None = None,
 ) -> str:
-    modlist_name = smart_modlist_display_name(mo2_root, fallback=fallback_modlist_name)
+    modlist_name = smart_modlist_display_name(
+        mo2_root,
+        fallback=fallback_modlist_name,
+        profile_name=profile_name,
+    )
     safe_name = _safe_windows_component(f"{modlist_name} - Turkce Ceviri")
     return safe_name or "Modlist - Turkce Ceviri"
 

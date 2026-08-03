@@ -16,6 +16,7 @@ from modlist_translation_wizard.gui_model import (
     preflight_summary,
     release_branding_asset_bytes,
     release_branding_asset_path,
+    resolve_installer_mo2_location,
     run_workspace_for_manifest,
     smart_modlist_display_name,
     translation_output_mod_name,
@@ -33,6 +34,53 @@ def test_discover_mo2_profiles_returns_profiles_with_modlist(tmp_path) -> None:
     (profiles / "Ultra" / "modlist.txt").write_text("+Example", encoding="utf-8")
 
     assert discover_mo2_profiles(tmp_path) == ["Default", "Ultra"]
+
+
+def test_nolvus_root_resolves_split_mo2_profiles_and_mods(tmp_path) -> None:
+    nolvus_root = tmp_path / "NOLVUS"
+    instance_root = nolvus_root / "Instances" / "Nolvus Awakening"
+    mo2_root = instance_root / "MO2"
+    data_root = instance_root / "MODS"
+    profile_root = data_root / "profiles" / "Nolvus Awakening"
+    mods_root = data_root / "mods"
+    mo2_root.mkdir(parents=True)
+    profile_root.mkdir(parents=True)
+    mods_root.mkdir(parents=True)
+    (profile_root / "modlist.txt").write_text("+Example", encoding="utf-8")
+    (mo2_root / "ModOrganizer.ini").write_text(
+        f"base_directory={data_root.resolve().as_posix()}\n",
+        encoding="utf-8",
+    )
+
+    assert discover_mo2_profiles(nolvus_root) == ["Nolvus Awakening"]
+    location = resolve_installer_mo2_location(nolvus_root, "Nolvus Awakening")
+
+    assert location is not None
+    assert location.instance_root == instance_root
+    assert location.data_root == data_root
+    assert location.profiles_dir == data_root / "profiles"
+    assert location.mods_dir == mods_root
+    assert location.display_name == "Nolvus Awakening"
+    assert location.layout_kind == "modorganizer-ini"
+    assert translation_output_mod_name(
+        nolvus_root,
+        profile_name="Nolvus Awakening",
+    ) == "Nolvus Awakening - Turkce Ceviri"
+
+
+def test_standard_mo2_root_still_resolves_direct_mods_directory(tmp_path) -> None:
+    profile_root = tmp_path / "profiles" / "Default"
+    mods_root = tmp_path / "mods"
+    profile_root.mkdir(parents=True)
+    mods_root.mkdir()
+    (profile_root / "modlist.txt").write_text("+Example", encoding="utf-8")
+
+    location = resolve_installer_mo2_location(tmp_path, "Default")
+
+    assert location is not None
+    assert location.data_root == tmp_path
+    assert location.mods_dir == mods_root
+    assert location.layout_kind == "standard"
 
 
 def test_run_workspace_for_manifest_is_manifest_specific(tmp_path) -> None:
