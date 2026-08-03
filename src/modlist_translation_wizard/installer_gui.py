@@ -1942,6 +1942,40 @@ class ModlistTranslationInstallerApp:
             font=ctk.CTkFont(family="Segoe UI", size=17, weight="bold"),
         ).pack(anchor="w", padx=24, pady=(0, 22))
 
+        completion_notice = self.branding.completion_notice
+        if completion_notice is not None:
+            notice_frame = ctk.CTkFrame(
+                card,
+                fg_color=self.colors["panel_alt"],
+                corner_radius=10,
+                border_width=1,
+                border_color=self.colors["line"],
+            )
+            notice_frame.pack(fill=tk.X, padx=24, pady=(0, 18))
+            ctk.CTkLabel(
+                notice_frame,
+                text=completion_notice.text,
+                text_color=self.colors["text"],
+                justify=tk.LEFT,
+                anchor="w",
+                wraplength=610,
+                font=ctk.CTkFont(family="Segoe UI", size=14),
+            ).pack(fill=tk.X, padx=14, pady=(12, 8 if completion_notice.url else 12))
+            if completion_notice.url:
+                ctk.CTkButton(
+                    notice_frame,
+                    text=completion_notice.action_label or "Mod sayfasını aç",
+                    command=lambda url=completion_notice.url: webbrowser.open(
+                        url,
+                        new=2,
+                        autoraise=True,
+                    ),
+                    corner_radius=9,
+                    fg_color=self.colors["button"],
+                    hover_color=self.colors["button_hover"],
+                    height=36,
+                ).pack(anchor="w", padx=14, pady=(0, 12))
+
         buttons = ctk.CTkFrame(card, fg_color="transparent")
         buttons.pack(fill=tk.X, padx=24, pady=(0, 22))
         buttons.columnconfigure(0, weight=1)

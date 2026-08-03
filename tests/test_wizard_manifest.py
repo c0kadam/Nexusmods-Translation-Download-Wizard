@@ -38,6 +38,11 @@ def test_stable_manifest_exports_only_complete_approved_candidates() -> None:
     assert payload["summary"]["artifact_reference_count"] == 2
     assert payload["summary"]["unique_download_count"] == 2
     assert payload["summary"]["skipped"]["status_needs_review"] == 1
+    assert payload["conversion"] == {
+        "include_needs_review": False,
+        "mark_review_outputs": False,
+        "review_conflict_policy": "merge_unique_review_entries",
+    }
     entry = payload["entries"][0]
     assert entry["target"]["path"] == "Example.esp"
     assert entry["base"]["nexus_mod_id"] == 111
@@ -716,6 +721,7 @@ def test_conversion_passes_manifest_local_dsd_sources(tmp_path, monkeypatch) -> 
 
     def fake_convert(**kwargs):
         captured["local_dsd_sources"] = kwargs["local_dsd_sources"]
+        captured["mark_review_outputs"] = kwargs["mark_review_outputs"]
         captured["include_all_profile_translation_memory_aliases"] = kwargs[
             "include_all_profile_translation_memory_aliases"
         ]
@@ -749,10 +755,135 @@ def test_conversion_passes_manifest_local_dsd_sources(tmp_path, monkeypatch) -> 
     )
 
     assert captured["local_dsd_sources"] == [local_source]
+    assert captured["mark_review_outputs"] is False
     assert captured["include_all_profile_translation_memory_aliases"] is True
     assert result.result_payload["local_dsd_sources"] == [str(local_source)]
     assert result.conversion.manifest_path.name == "mtw_dsd_conversion_manifest.json"
     assert result.conversion.report_path.name == "mtw_dsd_conversion_report.md"
+
+
+def test_extended_conversion_does_not_mark_review_outputs_without_manifest_opt_in(
+    tmp_path, monkeypatch
+) -> None:
+    profile = _profile()
+    manifest = _manifest(profile=profile)
+    manifest["channel"] = "extended"
+    manifest.pop("conversion", None)
+    manifest_result = write_wizard_manifest(manifest, tmp_path / "wizard.json")
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    decisions_path = tmp_path / "decisions.json"
+    decisions_path.write_text('{"decisions":[]}', encoding="utf-8")
+    first_archive = tmp_path / "444.7z"
+    second_archive = tmp_path / "445.7z"
+    first_archive.write_bytes(b"archive-444")
+    second_archive.write_bytes(b"archive-445")
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _download_queue(
+                first_archive=first_archive,
+                second_archive=second_archive,
+            )
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_convert(**kwargs):
+        captured["mark_review_outputs"] = kwargs["mark_review_outputs"]
+        output_mod_path = Path(kwargs["output_root"]) / "LoreRim - Turkish DSD Output"
+        output_mod_path.mkdir(parents=True)
+        conversion_dir = Path(kwargs["out_dir"])
+        conversion_dir.mkdir(parents=True)
+        manifest_path = conversion_dir / "converter_manifest.json"
+        report_path = conversion_dir / "converter_report.md"
+        payload = {"summary": {"processed_archives": 2, "failed_items": 0}}
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        report_path.write_text("ok", encoding="utf-8")
+        return WizardArchiveConversionRunResult(
+            manifest_path=manifest_path,
+            report_path=report_path,
+            output_mod_path=output_mod_path,
+            manifest_payload=payload,
+        )
+
+    monkeypatch.setattr(
+        "modlist_translation_wizard.runtime.convert_downloaded_archives_to_mtw_dsd",
+        fake_convert,
+    )
+
+    convert_downloaded_translations_from_manifest(
+        manifest_path=manifest_result.manifest_path,
+        profile_scan_path=profile_path,
+        decisions_path=decisions_path,
+        download_queue_path=queue_path,
+        out_dir=tmp_path / "runtime",
+    )
+
+    assert captured["mark_review_outputs"] is False
+
+
+def test_conversion_can_opt_in_to_mark_review_outputs(tmp_path, monkeypatch) -> None:
+    profile = _profile()
+    manifest = _manifest(profile=profile)
+    manifest["conversion"] = {
+        "include_needs_review": True,
+        "mark_review_outputs": True,
+    }
+    manifest_result = write_wizard_manifest(manifest, tmp_path / "wizard.json")
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    decisions_path = tmp_path / "decisions.json"
+    decisions_path.write_text('{"decisions":[]}', encoding="utf-8")
+    first_archive = tmp_path / "444.7z"
+    second_archive = tmp_path / "445.7z"
+    first_archive.write_bytes(b"archive-444")
+    second_archive.write_bytes(b"archive-445")
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _download_queue(
+                first_archive=first_archive,
+                second_archive=second_archive,
+            )
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_convert(**kwargs):
+        captured["mark_review_outputs"] = kwargs["mark_review_outputs"]
+        output_mod_path = Path(kwargs["output_root"]) / "LoreRim - Turkish DSD Output"
+        output_mod_path.mkdir(parents=True)
+        conversion_dir = Path(kwargs["out_dir"])
+        conversion_dir.mkdir(parents=True)
+        manifest_path = conversion_dir / "converter_manifest.json"
+        report_path = conversion_dir / "converter_report.md"
+        payload = {"summary": {"processed_archives": 2, "failed_items": 0}}
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        report_path.write_text("ok", encoding="utf-8")
+        return WizardArchiveConversionRunResult(
+            manifest_path=manifest_path,
+            report_path=report_path,
+            output_mod_path=output_mod_path,
+            manifest_payload=payload,
+        )
+
+    monkeypatch.setattr(
+        "modlist_translation_wizard.runtime.convert_downloaded_archives_to_mtw_dsd",
+        fake_convert,
+    )
+
+    convert_downloaded_translations_from_manifest(
+        manifest_path=manifest_result.manifest_path,
+        profile_scan_path=profile_path,
+        decisions_path=decisions_path,
+        download_queue_path=queue_path,
+        out_dir=tmp_path / "runtime",
+    )
+
+    assert captured["mark_review_outputs"] is True
 
 
 def test_conversion_stages_output_without_installing_to_mo2(tmp_path, monkeypatch) -> None:

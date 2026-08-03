@@ -45,6 +45,7 @@ from modlist_translation_wizard.archive_conversion import (
     WizardArchiveConversionRunResult,
     convert_downloaded_archives_to_mtw_dsd,
 )
+from modlist_translation_wizard.archive_tools import activate_archive_tool
 from modlist_translation_wizard.manifest import (
     WizardManifestError,
     load_wizard_manifest,
@@ -275,7 +276,7 @@ def plan_downloads_from_manifest(
             language=str(manifest.get("language") or "tr"),
             download_dir=download_dir,
             out_dir=output_dir / "premium-download-plan",
-            include_needs_review=manifest.get("channel") == "extended",
+            include_needs_review=_manifest_include_needs_review(manifest),
             auth_env_var=auth_env_var,
             additional_download_dirs=download_cache_roots,
         )
@@ -374,6 +375,10 @@ def convert_downloaded_translations_from_manifest(
     progress_status_path: Path | str | None = None,
 ) -> WizardConversionResult:
     _write_conversion_progress(progress_status_path, "loading_manifest")
+    archive_tool = activate_archive_tool(seven_zip_path)
+    resolved_seven_zip_path = (
+        Path(archive_tool.path) if archive_tool.available and archive_tool.path else None
+    )
     manifest_file = Path(manifest_path)
     manifest = load_wizard_manifest(manifest_path)
     _write_conversion_progress(progress_status_path, "loading_profile")
@@ -413,11 +418,11 @@ def convert_downloaded_translations_from_manifest(
         "language": language,
         "output_root": stage_root,
         "out_dir": output_dir / "conversion",
-        "seven_zip_path": seven_zip_path,
+        "seven_zip_path": resolved_seven_zip_path,
         "overwrite": overwrite,
         "local_dsd_sources": local_dsd_sources,
         "export_" + "ss" + "eat_db": False,
-        "mark_review_outputs": manifest.get("channel") == "extended",
+        "mark_review_outputs": _manifest_mark_review_outputs(manifest),
         "output_mod_name_override": output_name_override,
         "progress_status_path": progress_status_path,
         "include_all_profile_translation_memory_aliases": (
@@ -444,7 +449,7 @@ def convert_downloaded_translations_from_manifest(
         queue_payload=queue_payload,
         output_mod_path=Path(conversion.output_mod_path),
         out_dir=output_dir,
-        seven_zip_path=Path(seven_zip_path) if seven_zip_path is not None else None,
+        seven_zip_path=resolved_seven_zip_path,
         overwrite=overwrite,
     )
     add_on_summary = add_on_payload.get("summary", {})
@@ -473,6 +478,7 @@ def convert_downloaded_translations_from_manifest(
         "add_on_packages": add_on_payload,
         "native_binary_assets": binary_payload,
         "local_dsd_sources": [str(path) for path in local_dsd_sources],
+        "archive_backend": archive_tool.to_payload(),
     }
     _write_conversion_progress(progress_status_path, "writing_result")
     result_path = output_dir / "wizard_conversion_result.json"
@@ -509,6 +515,25 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+
+
+def _manifest_conversion_config(manifest: dict[str, Any]) -> dict[str, Any]:
+    conversion = manifest.get("conversion")
+    return conversion if isinstance(conversion, dict) else {}
+
+
+def _manifest_include_needs_review(manifest: dict[str, Any]) -> bool:
+    conversion = _manifest_conversion_config(manifest)
+    if isinstance(conversion.get("include_needs_review"), bool):
+        return bool(conversion["include_needs_review"])
+    return manifest.get("channel") == "extended"
+
+
+def _manifest_mark_review_outputs(manifest: dict[str, Any]) -> bool:
+    conversion = _manifest_conversion_config(manifest)
+    if isinstance(conversion.get("mark_review_outputs"), bool):
+        return bool(conversion["mark_review_outputs"])
+    return False
 
 
 def load_wizard_conversion_result(result_path: Path | str) -> WizardConversionResult:

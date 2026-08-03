@@ -21,6 +21,10 @@ from typing import Any
 from modlist_translate_tool.dsd.dynamic_string_converter import (
     PLUGIN_CONVERSION_WORKER_COMMAND_ENV,
 )
+from modlist_translation_wizard.archive_tools import (
+    activate_archive_tool,
+    write_archive_tool_diagnostic,
+)
 from modlist_translation_wizard.runtime import (
     WizardConversionResult,
     convert_downloaded_translations_from_manifest,
@@ -125,8 +129,31 @@ def run_conversion_worker(config_path: Path | str) -> int:
         },
     )
     previous_plugin_worker_command = os.environ.get(PLUGIN_CONVERSION_WORKER_COMMAND_ENV)
+    archive_backend_status: dict[str, Any] = {}
     try:
         os.environ[PLUGIN_CONVERSION_WORKER_COMMAND_ENV] = json.dumps(_plugin_worker_command())
+        archive_tool = activate_archive_tool()
+        archive_tool_diagnostic_path = write_archive_tool_diagnostic(
+            status_path.parent / "archive_backend.json",
+            archive_tool,
+        )
+        archive_backend_status = {
+            "archive_backend_status": archive_tool.status,
+            "archive_backend_source": archive_tool.source,
+            "archive_backend_version": archive_tool.version,
+            "archive_backend_diagnostic": str(archive_tool_diagnostic_path),
+        }
+        if (
+            not archive_tool.available
+            and _queue_requires_external_archive_tool(
+                Path(str(config["download_queue_path"]))
+            )
+        ):
+            raise RuntimeError(
+                "7-Zip arsiv motoru calistirilamadi. Paket icindeki arac guvenlik "
+                "yazilimi tarafindan engellenmis olabilir ve kullanilabilir bir sistem "
+                f"7-Zip kurulumu bulunamadi. Tani: {archive_tool_diagnostic_path}"
+            )
         _write_status(
             status_path,
             {
@@ -134,6 +161,7 @@ def run_conversion_worker(config_path: Path | str) -> int:
                 "ok": False,
                 "created_at": _now(),
                 "stage": "running_conversion",
+                **archive_backend_status,
             },
         )
         result = convert_downloaded_translations_from_manifest(
@@ -146,6 +174,7 @@ def run_conversion_worker(config_path: Path | str) -> int:
             output_mod_name_override=str(config["output_mod_name_override"]),
             allow_profile_drift=bool(config["allow_profile_drift"]),
             progress_status_path=progress_status_path,
+            seven_zip_path=Path(archive_tool.path) if archive_tool.path else None,
         )
     except BaseException as exc:  # noqa: BLE001 - child process boundary must report SystemExit too.
         _write_status(
@@ -157,6 +186,7 @@ def run_conversion_worker(config_path: Path | str) -> int:
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
+                **archive_backend_status,
             },
         )
         return 1
@@ -174,6 +204,7 @@ def run_conversion_worker(config_path: Path | str) -> int:
             "created_at": _now(),
             "result_path": str(result.result_path),
             "output_mod_path": str(result.conversion.output_mod_path),
+            **archive_backend_status,
         },
     )
     return 0
@@ -340,6 +371,14 @@ def _worker_failure_message(
     stderr = _decode_output(completed.stderr).strip()
     if stderr:
         details = f"{details}\n\nWorker stderr:\n{stderr[-2000:]}"
+    archive_backend_diagnostic = str(
+        status.get("archive_backend_diagnostic") or ""
+    ).strip()
+    archive_backend_line = (
+        f"\nArsiv backend tanisi: {archive_backend_diagnostic}"
+        if archive_backend_diagnostic
+        else ""
+    )
     return (
         "Ceviri hazirlama islemi ayri worker process icinde basarisiz oldu.\n"
         f"Cikis kodu: {completed.returncode}\n"
@@ -348,6 +387,7 @@ def _worker_failure_message(
         f"Worker durum dosyasi: {status_path}\n"
         f"Ilerleme dosyasi: {progress_path}\n"
         f"Korunan hata tanisi: {diagnostics_path}"
+        f"{archive_backend_line}"
     )
 
 
@@ -382,6 +422,23 @@ def _decode_output(value: bytes | str | None) -> str:
     if isinstance(value, str):
         return value
     return value.decode("utf-8", errors="replace")
+
+
+def _queue_requires_external_archive_tool(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        archive_path = str(item.get("local_archive_path") or "").strip()
+        if Path(archive_path).suffix.casefold() in {".7z", ".rar"}:
+            return True
+    return False
 
 
 def _now() -> str:

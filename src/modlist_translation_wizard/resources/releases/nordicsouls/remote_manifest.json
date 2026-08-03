@@ -6,7 +6,7 @@
   "channel": "stable",
   "repository": "c0kadam/NTDW-TranslationMAPS",
   "branch": "main",
-  "index_path": "{remote_list_id}/{channel}/index.json",
+  "index_path": "{remote_list_id}/index.json",
   "allow_hosts": [
     "raw.githubusercontent.com"
   ],

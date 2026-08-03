@@ -230,6 +230,11 @@ def build_wizard_manifest(
             "install_mode": "STAGED_MO2_MOD",
             "profile_activation_requires_confirmation": True,
         },
+        "conversion": {
+            "include_needs_review": normalized_channel == "extended",
+            "mark_review_outputs": False,
+            "review_conflict_policy": "merge_unique_review_entries",
+        },
         "nexus": {
             "discovery_enabled": False,
             "request_scope": "KNOWN_MOD_AND_FILE_IDS_ONLY",
@@ -323,6 +328,15 @@ def validate_wizard_manifest(payload: dict[str, Any]) -> None:
         raise WizardManifestError("wizard request scope must be known Nexus IDs only")
     if payload.get("channel") not in _SUPPORTED_CHANNELS:
         raise WizardManifestError("invalid wizard release channel")
+    conversion = payload.get("conversion")
+    if conversion is not None:
+        if not isinstance(conversion, dict):
+            raise WizardManifestError("wizard conversion config must be an object")
+        for key in ("include_needs_review", "mark_review_outputs"):
+            if key in conversion and not isinstance(conversion.get(key), bool):
+                raise WizardManifestError(
+                    f"wizard conversion config field must be boolean: {key}"
+                )
     entries = payload.get("entries")
     if not isinstance(entries, list):
         raise WizardManifestError("wizard manifest entries must be a list")

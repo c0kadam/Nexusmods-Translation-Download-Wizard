@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+import modlist_translation_wizard.remote_manifest as remote_manifest_module
 
 from modlist_translation_wizard.bundled import (
     MANIFEST_MODE_LOCAL,
@@ -156,7 +157,7 @@ def test_remote_manifest_can_use_modlist_scoped_github_index(tmp_path) -> None:
     assert result.index_url == index_url
 
 
-def test_nordicsouls_release_uses_channel_scoped_ota_index() -> None:
+def test_nordicsouls_release_uses_modlist_scoped_ota_index() -> None:
     config_path = (
         Path(__file__).resolve().parents[1]
         / "src"
@@ -175,7 +176,7 @@ def test_nordicsouls_release_uses_channel_scoped_ota_index() -> None:
     )
 
     assert config is not None
-    assert config.index_url.endswith("/NordicSouls/stable/index.json")
+    assert config.index_url.endswith("/NordicSouls/index.json")
 
 
 def test_default_loader_always_refreshes_configured_remote_manifest(
@@ -381,6 +382,56 @@ def test_remote_manifest_rejects_untrusted_manifest_host(tmp_path) -> None:
     )
 
     assert resolve_remote_manifest(config, fetcher=fetcher) is None
+
+
+def test_http_fetch_retries_incomplete_response(monkeypatch) -> None:
+    expected = b'{"complete": true}'
+    calls = 0
+
+    class Response:
+        def __init__(self, data: bytes, *, start: int = 0) -> None:
+            self.data = data
+            self.headers = {"Content-Length": str(len(data))}
+            if start:
+                self.headers["Content-Range"] = (
+                    f"bytes {start}-{len(expected) - 1}/{len(expected)}"
+                )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return "https://raw.githubusercontent.com/example/manifest.json"
+
+        def read(self, _limit: int) -> bytes:
+            return self.data
+
+    def urlopen(_request, *, timeout: float):
+        nonlocal calls
+        assert timeout == 30
+        calls += 1
+        if calls == 1:
+            response = Response(expected[:5])
+            response.headers["Content-Length"] = str(len(expected))
+            return response
+        assert _request.get_header("Range") == "bytes=5-"
+        return Response(expected[5:], start=5)
+
+    monkeypatch.setattr(remote_manifest_module, "urlopen", urlopen)
+    monkeypatch.setattr(remote_manifest_module.time, "sleep", lambda _seconds: None)
+
+    result = remote_manifest_module._fetch_url_bytes(
+        "https://raw.githubusercontent.com/example/manifest.json",
+        30,
+        1024,
+        ("raw.githubusercontent.com",),
+    )
+
+    assert result == expected
+    assert calls == 2
 
 
 def _fetcher(mapping: dict[str, bytes]):

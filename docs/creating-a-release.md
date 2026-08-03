@@ -25,6 +25,7 @@ src/modlist_translation_wizard/resources/releases/<release-id>/
   manifest.json
   manifest.json.sha256
   branding.json
+  remote_manifest.json
   banner.png
   icon.ico
 ```
@@ -48,6 +49,11 @@ src/modlist_translation_wizard/resources/releases/<release-id>/
     "game_domain": "skyrimspecialedition",
     "mod_id": 123456,
     "label": "Example List Türkçe Çeviri Paketi"
+  },
+  "completion_notice": {
+    "text": "Kurulumdan sonra bu release için gereken ek adımı unutmayın.",
+    "action_label": "Mod sayfasını aç",
+    "url": "https://www.nexusmods.com/skyrimspecialedition/mods/123456?tab=files"
   }
 }
 ```
@@ -62,6 +68,10 @@ düğmesini, `warm_glow` ise banner çerçevesiyle vurgu durumlarını belirler.
 `mod_id` çeviri sayfasını, `label` ise kullanıcıya gösterilecek paket adını belirler.
 Alan kaldırılır veya `enabled` değeri `false` yapılırsa düğme gösterilmez. Araç
 unendorse ya da abstain isteği göndermez.
+
+İsteğe bağlı `completion_notice` alanı, kurulum tamamlandığında release'e özel
+bir bilgi kutusu gösterir. Bağlantı yalnızca `https` adresi olduğunda düğme olarak
+sunulur; alan kaldırılırsa standart tamamlanma penceresi değişmeden kullanılır.
 
 ## Uzaktan Manifest Kanalı
 
@@ -473,6 +483,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build_standalone.ps1 `
 dist\standalone\CeviriAraci.exe
 dist\standalone.zip
 ```
+
+Build sırasında resmi 7-Zip konsol runtime'ı indirilir ve SHA-256 ile
+doğrulanır. Son pakette `tools/7zip/7z.exe`, `7z.dll` ve resmi lisans
+metni bulunmalıdır. Bu dosyalar `.7z` ve `.rar` çeviri arşivlerinin
+kullanıcı sisteminde ayrıca 7-Zip kurulumu gerektirmeden açılmasını sağlar.
 
 ## Dikkat Edilecekler
 

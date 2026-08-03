@@ -102,6 +102,23 @@ def test_release_branding_loads_bundled_lorerim_defaults() -> None:
     assert release_branding_asset_bytes(_manifest(), branding.banner)
 
 
+def test_release_branding_loads_nolvus_completion_notice() -> None:
+    manifest = _manifest()
+    manifest["modlist"]["id"] = "nolvus-awakening"
+    manifest["modlist"]["name"] = "Nolvus Awakening"
+
+    branding = load_release_branding(manifest)
+
+    assert branding.display_name == "Nolvus Awakening Türkçe Çeviri Aracı"
+    assert branding.banner == "nolvusTurkceBanner.png"
+    assert branding.completion_notice is not None
+    assert "Edge, Untarnished veya Oathvein" in branding.completion_notice.text
+    assert branding.completion_notice.url == (
+        "https://www.nexusmods.com/skyrimspecialedition/mods/164744?tab=files"
+    )
+    assert release_branding_asset_bytes(manifest, branding.banner)
+
+
 def test_release_branding_loads_external_release_assets(tmp_path, monkeypatch) -> None:
     release_dir = tmp_path / "release"
     release_dir.mkdir()
@@ -115,6 +132,11 @@ def test_release_branding_loads_external_release_assets(tmp_path, monkeypatch) -
                 "font_color": "#ABCDEF",
                 "font_shadow": "#010203",
                 "warm_glow": "#A04020",
+                "completion_notice": {
+                    "text": "Kurulumdan sonra ek dosyayı kontrol edin.",
+                    "action_label": "Mod sayfasını aç",
+                    "url": "https://www.nexusmods.com/example",
+                },
             }
         ),
         encoding="utf-8",
@@ -129,7 +151,36 @@ def test_release_branding_loads_external_release_assets(tmp_path, monkeypatch) -
     assert branding.font_color == "#ABCDEF"
     assert branding.font_shadow == "#010203"
     assert branding.warm_glow == "#A04020"
+    assert branding.completion_notice is not None
+    assert branding.completion_notice.text == "Kurulumdan sonra ek dosyayı kontrol edin."
+    assert branding.completion_notice.action_label == "Mod sayfasını aç"
+    assert branding.completion_notice.url == "https://www.nexusmods.com/example"
     assert release_branding_asset_bytes(_manifest(), branding.banner) == b"external-banner"
+
+
+def test_release_branding_rejects_unsafe_completion_notice_url(tmp_path, monkeypatch) -> None:
+    release_dir = tmp_path / "release"
+    release_dir.mkdir()
+    (release_dir / "branding.json").write_text(
+        json.dumps(
+            {
+                "completion_notice": {
+                    "text": "Ek bilgi",
+                    "action_label": "Aç",
+                    "url": "file:///tmp/example",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MTW_RELEASE_DIR", str(release_dir))
+
+    branding = load_release_branding(_manifest())
+
+    assert branding.completion_notice is not None
+    assert branding.completion_notice.text == "Ek bilgi"
+    assert branding.completion_notice.action_label is None
+    assert branding.completion_notice.url is None
 
 
 def test_release_branding_rejects_invalid_color_values(tmp_path, monkeypatch) -> None:

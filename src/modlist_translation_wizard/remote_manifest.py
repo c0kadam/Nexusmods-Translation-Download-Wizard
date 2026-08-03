@@ -8,8 +8,10 @@ No code or scripts are ever loaded from the remote location.
 from __future__ import annotations
 
 import hashlib
+from http.client import IncompleteRead
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,6 +37,7 @@ _DEFAULT_TIMEOUT_SECONDS = 8.0
 _DEFAULT_CACHE_TTL_SECONDS = 60 * 60
 _DEFAULT_MAX_INDEX_BYTES = 256 * 1024
 _DEFAULT_MAX_MANIFEST_BYTES = 32 * 1024 * 1024
+_REMOTE_FETCH_ATTEMPTS = 3
 _CACHE_DIR_ENV_VAR = "MTW_REMOTE_MANIFEST_CACHE_DIR"
 
 UrlFetcher = Callable[[str, float, int, tuple[str, ...]], bytes]
@@ -373,23 +376,91 @@ def _fetch_url_bytes(
     allow_hosts: tuple[str, ...],
 ) -> bytes:
     _validate_remote_url(url, allow_hosts)
-    request = Request(
-        url,
-        headers={
+    last_error: Exception | None = None
+    downloaded = bytearray()
+    expected_total: int | None = None
+    for attempt in range(_REMOTE_FETCH_ATTEMPTS):
+        headers = {
             "Accept": "application/json",
             "User-Agent": f"{TOOL_NAME}/{__version__}",
-        },
-    )
+        }
+        range_start = len(downloaded)
+        if range_start:
+            headers["Range"] = f"bytes={range_start}-"
+        request = Request(
+            url,
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                final_url = response.geturl()
+                _validate_remote_url(final_url, allow_hosts)
+                content_length = _response_content_length(response.headers)
+                content_range = _response_content_range(response.headers)
+                if content_range is not None:
+                    response_start, response_total = content_range
+                    if response_start != range_start:
+                        raise RemoteManifestError("remote manifest range response is invalid")
+                    expected_total = response_total
+                elif range_start:
+                    downloaded.clear()
+                    range_start = 0
+                    expected_total = content_length
+                elif content_length is not None:
+                    expected_total = content_length
+                if expected_total is not None and expected_total > max_bytes:
+                    raise RemoteManifestError("remote manifest response exceeds size limit")
+                try:
+                    data = response.read(max_bytes - range_start + 1)
+                except IncompleteRead as exc:
+                    data = exc.partial
+                    last_error = exc
+            downloaded.extend(data)
+            if len(downloaded) > max_bytes:
+                raise RemoteManifestError("remote manifest response exceeds size limit")
+            if expected_total is None or len(downloaded) == expected_total:
+                return bytes(downloaded)
+            if len(downloaded) > expected_total:
+                raise RemoteManifestError("remote manifest response length is invalid")
+            last_error = IncompleteRead(bytes(downloaded), expected_total - len(downloaded))
+        except RemoteManifestError:
+            raise
+        except (IncompleteRead, OSError, URLError) as exc:
+            last_error = exc
+        if attempt + 1 < _REMOTE_FETCH_ATTEMPTS:
+            time.sleep(float(attempt + 1))
+    raise RemoteManifestError(
+        f"remote manifest download failed after {_REMOTE_FETCH_ATTEMPTS} attempts: {last_error}"
+    ) from last_error
+
+
+def _response_content_length(headers: object) -> int | None:
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    value = getter("Content-Length")
+    if value is None:
+        return None
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            final_url = response.geturl()
-            _validate_remote_url(final_url, allow_hosts)
-            data = response.read(max_bytes + 1)
-    except (OSError, URLError) as exc:
-        raise RemoteManifestError(f"remote manifest download failed: {exc}") from exc
-    if len(data) > max_bytes:
-        raise RemoteManifestError("remote manifest response exceeds size limit")
-    return data
+        length = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return length if length >= 0 else None
+
+
+def _response_content_range(headers: object) -> tuple[int, int] | None:
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    value = str(getter("Content-Range") or "").strip()
+    match = re.fullmatch(r"bytes\s+(\d+)-\d+/(\d+)", value, flags=re.IGNORECASE)
+    if not match:
+        return None
+    start = int(match.group(1))
+    total = int(match.group(2))
+    if start < 0 or total <= start:
+        return None
+    return start, total
 
 
 def _required_url(value: object, config: RemoteManifestConfig) -> str:

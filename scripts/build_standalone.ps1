@@ -25,6 +25,15 @@ $BuildRoot = Join-Path $TempBuildParent ("nuitka-" + $BuildStamp)
 $NuitkaCacheRoot = Join-Path $TempBuildParent "cache"
 $FinalDir = [System.IO.Path]::GetFullPath($OutputRoot)
 $ReleaseSource = [System.IO.Path]::GetFullPath($ReleaseSource)
+$SevenZipVersion = "26.02"
+$SevenZipBootstrapUrl = "https://github.com/ip7z/7zip/releases/download/26.02/7zr.exe"
+$SevenZipBootstrapSha256 = "56b8cc9f4971cef253644fafe54063ed7fdca551d4dee0f8c6baa81b855acd72"
+$SevenZipInstallerUrl = "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-x64.exe"
+$SevenZipInstallerSha256 = "6745fa76dc2ea031596d8678f6f6b99c3c1b435b4164a63485adbbc7b8d82ef0"
+$SevenZipRuntimeHashes = @{
+    "7z.exe" = "83967f1b02b43c4efeda302795722c809e0e81b8307de73558d10484d5676a7d"
+    "7z.dll" = "69fd4df057985c40e510e2fac182881c7f85e90aa13ec703f763a8fdb2ce61f8"
+}
 
 function Assert-UnderProject([string]$PathValue, [string]$Label) {
     $full = [System.IO.Path]::GetFullPath($PathValue)
@@ -40,6 +49,100 @@ function Invoke-Checked([string]$FilePath, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) {
         throw "Command failed with exit code $LASTEXITCODE`: $FilePath"
     }
+}
+
+function Assert-UnderDirectory([string]$PathValue, [string]$RootValue, [string]$Label) {
+    $full = [System.IO.Path]::GetFullPath($PathValue)
+    $root = [System.IO.Path]::GetFullPath($RootValue).TrimEnd('\') + '\'
+    if (-not $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label escaped its expected root: $full"
+    }
+}
+
+function Assert-FileHash([string]$PathValue, [string]$ExpectedSha256, [string]$Label) {
+    if (-not (Test-Path -LiteralPath $PathValue -PathType Leaf)) {
+        throw "$Label not found: $PathValue"
+    }
+    $actual = (Get-FileHash -LiteralPath $PathValue -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $ExpectedSha256.ToLowerInvariant()) {
+        throw "$Label SHA-256 mismatch. Expected $ExpectedSha256, got $actual"
+    }
+}
+
+function Get-VerifiedDownload(
+    [string]$Url,
+    [string]$Destination,
+    [string]$ExpectedSha256,
+    [string]$Label
+) {
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        $actual = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -eq $ExpectedSha256.ToLowerInvariant()) {
+            return
+        }
+        Remove-Item -LiteralPath $Destination -Force
+    }
+
+    Write-Host "Downloading verified $Label from the official 7-Zip release..."
+    Invoke-WebRequest -Uri $Url -OutFile $Destination
+    Assert-FileHash $Destination $ExpectedSha256 $Label
+}
+
+function Prepare-SevenZipRuntime() {
+    $cacheRoot = Join-Path $NuitkaCacheRoot ("third-party\7zip-" + $SevenZipVersion)
+    $bootstrap = Join-Path $cacheRoot "7zr.exe"
+    $installer = Join-Path $cacheRoot "7zip-x64-installer.exe"
+    $extractRoot = Join-Path $cacheRoot "runtime"
+    New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
+
+    Get-VerifiedDownload `
+        $SevenZipBootstrapUrl `
+        $bootstrap `
+        $SevenZipBootstrapSha256 `
+        "7-Zip bootstrap executable"
+    Get-VerifiedDownload `
+        $SevenZipInstallerUrl `
+        $installer `
+        $SevenZipInstallerSha256 `
+        "7-Zip x64 installer"
+
+    $runtimeReady = $true
+    foreach ($entry in $SevenZipRuntimeHashes.GetEnumerator()) {
+        $runtimeFile = Join-Path $extractRoot $entry.Key
+        if (-not (Test-Path -LiteralPath $runtimeFile -PathType Leaf)) {
+            $runtimeReady = $false
+            break
+        }
+        $runtimeHash = (Get-FileHash -LiteralPath $runtimeFile -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($runtimeHash -ne $entry.Value.ToLowerInvariant()) {
+            $runtimeReady = $false
+            break
+        }
+    }
+
+    if (-not $runtimeReady) {
+        Assert-UnderDirectory $extractRoot $cacheRoot "7-Zip extraction directory"
+        Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+        Write-Host "Extracting verified 7-Zip runtime..."
+        & $bootstrap x $installer ("-o" + $extractRoot) -y | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not extract the verified 7-Zip runtime."
+        }
+    }
+
+    foreach ($entry in $SevenZipRuntimeHashes.GetEnumerator()) {
+        Assert-FileHash `
+            (Join-Path $extractRoot $entry.Key) `
+            $entry.Value `
+            ("7-Zip runtime " + $entry.Key)
+    }
+    foreach ($requiredFile in @("License.txt", "readme.txt")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $extractRoot $requiredFile) -PathType Leaf)) {
+            throw "7-Zip redistribution file not found: $requiredFile"
+        }
+    }
+    return $extractRoot
 }
 
 Assert-UnderProject $FinalDir "OutputRoot"
@@ -73,6 +176,7 @@ if (-not $SkipTests) {
 }
 
 Invoke-Checked "python" @("-B", "-m", "nuitka", "--version")
+$SevenZipRuntimeSource = Prepare-SevenZipRuntime
 
 Remove-Item -LiteralPath $BuildRoot -Recurse -Force -ErrorAction SilentlyContinue
 if (Test-Path -LiteralPath $FinalDir) {
@@ -170,7 +274,26 @@ if (Test-Path -LiteralPath (Join-Path $releaseOut "remote_manifest.json") -PathT
     Copy-Item -LiteralPath (Join-Path $releaseOut "remote_manifest.json") -Destination (Join-Path $packageResourcesOut "remote_manifest.json") -Force
 }
 
-$releaseDocs = @("README.md", "LICENSE", "SECURITY.md", "AUTHORS.md")
+$sevenZipOut = Join-Path $FinalDir "tools\7zip"
+New-Item -ItemType Directory -Path $sevenZipOut -Force | Out-Null
+foreach ($toolFile in @("7z.exe", "7z.dll", "License.txt", "readme.txt")) {
+    Copy-Item `
+        -LiteralPath (Join-Path $SevenZipRuntimeSource $toolFile) `
+        -Destination (Join-Path $sevenZipOut $toolFile) `
+        -Force
+}
+Set-Content `
+    -LiteralPath (Join-Path $sevenZipOut "VERSION.txt") `
+    -Value ("7-Zip " + $SevenZipVersion) `
+    -Encoding ascii
+
+$releaseDocs = @(
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "AUTHORS.md",
+    "THIRD_PARTY_NOTICES.md"
+)
 foreach ($docName in $releaseDocs) {
     $docPath = Join-Path $ProjectRoot $docName
     if (Test-Path -LiteralPath $docPath -PathType Leaf) {

@@ -1,0 +1,16 @@
+{
+  "schema_version": "mtw-remote-manifest-config.v1",
+  "enabled": true,
+  "list_id": "nolvus-awakening",
+  "remote_list_id": "NolvusAwakening",
+  "channel": "stable",
+  "repository": "c0kadam/NTDW-TranslationMAPS",
+  "branch": "main",
+  "index_path": "{remote_list_id}/index.json",
+  "allow_hosts": [
+    "raw.githubusercontent.com"
+  ],
+  "cache_ttl_seconds": 0,
+  "timeout_seconds": 60,
+  "allow_stale_cache": false
+}

@@ -11,6 +11,7 @@ from math import ceil
 from pathlib import Path
 from typing import Any
 from importlib.resources import files
+from urllib.parse import urlparse
 
 from modlist_translation_wizard.bundled import external_release_dirs
 from modlist_translation_wizard.endorsement import (
@@ -28,6 +29,13 @@ PREPARE_TRANSLATION_LABEL = "Çeviriyi hazırla"
 
 
 @dataclass(frozen=True, slots=True)
+class ReleaseCompletionNotice:
+    text: str
+    action_label: str | None = None
+    url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ReleaseBranding:
     display_name: str
     subtitle: str
@@ -38,6 +46,7 @@ class ReleaseBranding:
     banner: str | None = None
     icon: str | None = None
     endorsement: ReleaseEndorsementTarget | None = None
+    completion_notice: ReleaseCompletionNotice | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +188,32 @@ def _release_branding_from_json(
             payload.get("endorsement"),
             fallback_label=display_name,
         ),
+        completion_notice=_release_completion_notice(payload.get("completion_notice")),
+    )
+
+
+def _release_completion_notice(value: object) -> ReleaseCompletionNotice | None:
+    if not isinstance(value, dict):
+        return None
+    text = str(value.get("text") or "").strip()
+    if not text:
+        return None
+    action_label = str(value.get("action_label") or "").strip() or None
+    url = str(value.get("url") or "").strip() or None
+    if len(text) > 500:
+        text = text[:497].rstrip() + "..."
+    if action_label and len(action_label) > 80:
+        action_label = action_label[:77].rstrip() + "..."
+    if url:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            url = None
+    if not url:
+        action_label = None
+    return ReleaseCompletionNotice(
+        text=text,
+        action_label=action_label,
+        url=url,
     )
 
 

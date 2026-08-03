@@ -1,0 +1,21 @@
+{
+  "display_name": "Nolvus Awakening Türkçe Çeviri Aracı",
+  "subtitle": "- c0kadam - Nolvus Awakening için hazırlanmış çeviri paketi",
+  "banner": "nolvusTurkceBanner.png",
+  "icon": "icon.ico",
+  "accent_color": "#7A1118",
+  "font_color": "#F2EEE6",
+  "font_shadow": "#090909",
+  "warm_glow": "#B3262D",
+  "endorsement": {
+    "enabled": true,
+    "game_domain": "skyrimspecialedition",
+    "mod_id": 164744,
+    "label": "Nolvus Awakening Türkçe Yerelleştirme"
+  },
+  "completion_notice": {
+    "text": "Nolvus kurulumu sırasında seçtiğiniz arayüz (Edge, Untarnished veya Oathvein) için uygun Türkçe dosyayı mod sayfasından kurmayı unutmayın.",
+    "action_label": "UI çeviri sayfasını aç",
+    "url": "https://www.nexusmods.com/skyrimspecialedition/mods/164744?tab=files"
+  }
+}

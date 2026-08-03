@@ -59,6 +59,12 @@ dist\standalone\CeviriAraci.exe
 dist\standalone.zip
 ```
 
+Build betiği, `.7z` ve `.rar` desteği için resmi 7-Zip konsol bileşenlerini
+7-Zip yayınından indirir, sabit SHA-256 değerleriyle doğrular ve
+`tools\7zip` klasörüne ekler. İndirilen üçüncü taraf bileşenlerin lisans
+bilgileri release içinde ve [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+dosyasında bulunur.
+
 Farklı bir release manifest/branding klasörü kullanmak için:
 
 ```powershell

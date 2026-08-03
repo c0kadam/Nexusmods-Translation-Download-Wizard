@@ -6,6 +6,10 @@ from pathlib import Path
 import pytest
 
 from modlist_translation_wizard import conversion_worker
+from modlist_translation_wizard.archive_tools import (
+    ArchiveToolAttempt,
+    ArchiveToolResolution,
+)
 
 
 def test_worker_command_uses_python_module_in_source_runtime(tmp_path: Path, monkeypatch) -> None:
@@ -47,6 +51,175 @@ def test_plugin_worker_command_uses_launcher_exe_in_compiled_runtime(tmp_path: P
     command = conversion_worker._plugin_worker_command()
 
     assert command == [str(launcher.resolve()), "--plugin-convert-worker"]
+
+
+def test_conversion_worker_records_and_passes_archive_backend(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    seven_zip = tmp_path / "tools" / "7zip" / "7z.exe"
+    seven_zip.parent.mkdir(parents=True)
+    seven_zip.write_bytes(b"tool")
+    resolution = ArchiveToolResolution(
+        status="AVAILABLE",
+        path=str(seven_zip),
+        source="bundled",
+        version="26.02",
+        attempts=(
+            ArchiveToolAttempt(
+                source="bundled",
+                path=str(seven_zip),
+                status="AVAILABLE",
+            ),
+        ),
+    )
+    captured = {}
+    result_path = tmp_path / "runtime" / "wizard_conversion_result.json"
+    output_mod_path = tmp_path / "mods" / "Example - Turkce Ceviri"
+
+    def fake_convert(**kwargs):
+        captured["seven_zip_path"] = kwargs["seven_zip_path"]
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text('{"status":"COMPLETED"}\n', encoding="utf-8")
+        return SimpleNamespace(
+            result_path=result_path,
+            conversion=SimpleNamespace(output_mod_path=output_mod_path),
+        )
+
+    monkeypatch.setattr(conversion_worker, "activate_archive_tool", lambda: resolution)
+    monkeypatch.setattr(
+        conversion_worker,
+        "convert_downloaded_translations_from_manifest",
+        fake_convert,
+    )
+
+    worker_dir = tmp_path / "runtime" / "conversion-worker"
+    request_path = worker_dir / "request.json"
+    request_path.parent.mkdir(parents=True)
+    status_path = worker_dir / "status.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "manifest_path": str(tmp_path / "manifest.json"),
+                "profile_scan_path": str(tmp_path / "profile.json"),
+                "decisions_path": str(tmp_path / "decisions.json"),
+                "download_queue_path": str(tmp_path / "queue.json"),
+                "out_dir": str(tmp_path / "runtime"),
+                "staging_root": str(tmp_path / "mods"),
+                "output_mod_name_override": "Example - Turkce Ceviri",
+                "allow_profile_drift": True,
+                "status_path": str(status_path),
+                "progress_status_path": str(worker_dir / "progress.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = conversion_worker.run_conversion_worker(request_path)
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    diagnostic = json.loads(
+        (worker_dir / "archive_backend.json").read_text(encoding="utf-8")
+    )
+
+    assert exit_code == 0
+    assert captured["seven_zip_path"] == seven_zip
+    assert status["ok"] is True
+    assert diagnostic["status"] == "AVAILABLE"
+    assert diagnostic["source"] == "bundled"
+
+
+def test_conversion_worker_stops_early_when_external_archive_backend_is_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    resolution = ArchiveToolResolution(
+        status="UNAVAILABLE",
+        path=None,
+        source=None,
+        version=None,
+        attempts=(
+            ArchiveToolAttempt(
+                source="bundled",
+                path=str(tmp_path / "tools" / "7zip" / "7z.exe"),
+                status="REJECTED",
+                reason="launch_failed:PermissionError",
+            ),
+        ),
+    )
+    monkeypatch.setattr(conversion_worker, "activate_archive_tool", lambda: resolution)
+
+    def fail_if_called(**_kwargs):
+        raise AssertionError("conversion should not start without an archive backend")
+
+    monkeypatch.setattr(
+        conversion_worker,
+        "convert_downloaded_translations_from_manifest",
+        fail_if_called,
+    )
+
+    worker_dir = tmp_path / "runtime" / "conversion-worker"
+    worker_dir.mkdir(parents=True)
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "status": "READY",
+                        "local_archive_path": str(tmp_path / "translation.7z"),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    status_path = worker_dir / "status.json"
+    request_path = worker_dir / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "manifest_path": str(tmp_path / "manifest.json"),
+                "profile_scan_path": str(tmp_path / "profile.json"),
+                "decisions_path": str(tmp_path / "decisions.json"),
+                "download_queue_path": str(queue_path),
+                "out_dir": str(tmp_path / "runtime"),
+                "staging_root": str(tmp_path / "mods"),
+                "output_mod_name_override": "Example - Turkce Ceviri",
+                "allow_profile_drift": True,
+                "status_path": str(status_path),
+                "progress_status_path": str(worker_dir / "progress.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = conversion_worker.run_conversion_worker(request_path)
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 1
+    assert status["error_type"] == "RuntimeError"
+    assert "7-Zip arsiv motoru calistirilamadi" in status["error"]
+    assert status["archive_backend_status"] == "UNAVAILABLE"
+    assert Path(status["archive_backend_diagnostic"]).is_file()
+
+
+def test_zip_only_queue_does_not_require_external_archive_tool(tmp_path: Path) -> None:
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "status": "READY",
+                        "local_archive_path": str(tmp_path / "translation.zip"),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert conversion_worker._queue_requires_external_archive_tool(queue_path) is False
 
 
 def test_worker_accepts_success_status_after_abnormal_process_exit(tmp_path: Path, monkeypatch) -> None:
