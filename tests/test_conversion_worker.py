@@ -41,6 +41,23 @@ def test_worker_command_uses_launcher_exe_in_compiled_runtime(tmp_path: Path, mo
     assert command == [str(launcher.resolve()), "--convert-worker", str(tmp_path / "request.json")]
 
 
+def test_worker_command_prefers_dedicated_worker_in_compiled_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    launcher = tmp_path / "CeviriAraci.exe"
+    worker = tmp_path / "CeviriWorker.exe"
+    launcher.write_bytes(b"")
+    worker.write_bytes(b"")
+    monkeypatch.setattr(conversion_worker.sys, "argv", [str(launcher)])
+    monkeypatch.setattr(conversion_worker.sys, "executable", str(tmp_path / "python.exe"))
+    monkeypatch.setattr(conversion_worker, "_is_compiled_runtime", lambda: True)
+
+    command = conversion_worker._worker_command(tmp_path / "request.json")
+
+    assert command == [str(worker), "--convert-worker", str(tmp_path / "request.json")]
+
+
 def test_plugin_worker_command_uses_launcher_exe_in_compiled_runtime(tmp_path: Path, monkeypatch) -> None:
     launcher = tmp_path / "CeviriAraci.exe"
     launcher.write_bytes(b"")
@@ -51,6 +68,23 @@ def test_plugin_worker_command_uses_launcher_exe_in_compiled_runtime(tmp_path: P
     command = conversion_worker._plugin_worker_command()
 
     assert command == [str(launcher.resolve()), "--plugin-convert-worker"]
+
+
+def test_plugin_worker_command_prefers_dedicated_worker_in_compiled_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    launcher = tmp_path / "CeviriAraci.exe"
+    worker = tmp_path / "CeviriWorker.exe"
+    launcher.write_bytes(b"")
+    worker.write_bytes(b"")
+    monkeypatch.setattr(conversion_worker.sys, "argv", [str(launcher)])
+    monkeypatch.setattr(conversion_worker.sys, "executable", str(tmp_path / "python.exe"))
+    monkeypatch.setattr(conversion_worker, "_is_compiled_runtime", lambda: True)
+
+    command = conversion_worker._plugin_worker_command()
+
+    assert command == [str(worker), "--plugin-convert-worker"]
 
 
 def test_conversion_worker_records_and_passes_archive_backend(
@@ -453,3 +487,47 @@ def test_worker_does_not_retry_reported_conversion_error(
     )
     assert calls == 1
     assert diagnostics["retryable"] is False
+
+
+def test_worker_failure_message_decodes_native_heap_corruption(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(conversion_worker.os, "name", "nt")
+    progress_path = tmp_path / "progress.json"
+    progress_path.write_text(
+        json.dumps(
+            {
+                "stage": "running_archive_conversion",
+                "converter_stage": "processing_plugin_pair",
+                "processed_archives": 88,
+                "total_archives": 100,
+                "translation_nexus_mod_id": 123,
+                "translation_file_id": 456,
+                "archive_path": "translation.7z",
+                "member_path": "Example.esp",
+            }
+        ),
+        encoding="utf-8",
+    )
+    completed = subprocess.CompletedProcess(
+        ["CeviriWorker.exe"],
+        3221226356,
+        b"",
+        b"",
+    )
+
+    message = conversion_worker._worker_failure_message(
+        completed=completed,
+        status={},
+        status_path=tmp_path / "status.json",
+        progress_path=progress_path,
+        diagnostics_path=tmp_path / "last_failed_worker.json",
+        attempt=2,
+    )
+
+    assert "0xC0000374 STATUS_HEAP_CORRUPTION" in message
+    assert "Son asama: processing_plugin_pair" in message
+    assert "Arsiv ilerlemesi: 88/100" in message
+    assert "Nexus hedefi: 123/456" in message
+    assert "Son dosya: Example.esp" in message

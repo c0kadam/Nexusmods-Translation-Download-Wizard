@@ -119,6 +119,14 @@ function Prepare-SevenZipRuntime() {
             break
         }
     }
+    if ($runtimeReady) {
+        foreach ($requiredFile in @("License.txt", "readme.txt")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $extractRoot $requiredFile) -PathType Leaf)) {
+                $runtimeReady = $false
+                break
+            }
+        }
+    }
 
     if (-not $runtimeReady) {
         Assert-UnderDirectory $extractRoot $cacheRoot "7-Zip extraction directory"
@@ -190,6 +198,7 @@ New-Item -ItemType Directory -Path (Split-Path -Parent $FinalDir) -Force | Out-N
 
 $resourcesSource = Join-Path $ProjectRoot "src\modlist_translation_wizard\resources"
 $entryPoint = Join-Path $ProjectRoot "src\modlist_translation_wizard\__main__.py"
+$workerEntryPoint = Join-Path $ProjectRoot "src\modlist_translation_wizard\conversion_worker_main.py"
 $nuitkaArgs = @(
     "-B",
     "-m",
@@ -233,8 +242,45 @@ $nuitkaDist = $nuitkaDistCandidates | Where-Object { Test-Path -LiteralPath $_ -
 if (-not $nuitkaDist) {
     throw "Nuitka output not found under: $BuildRoot"
 }
+
+$workerNuitkaArgs = @(
+    "-B",
+    "-m",
+    "nuitka",
+    "--standalone",
+    "--remove-output",
+    "--disable-cache=all",
+    "--windows-console-mode=disable",
+    "--nofollow-import-to=tkinter,customtkinter,modlist_translation_wizard.installer_gui,modlist_translate_tool.gui",
+    ("--output-dir={0}" -f $BuildRoot),
+    "--output-filename=CeviriWorker.exe"
+)
+if ($WindowsResources) {
+    $workerNuitkaArgs += @(
+        "--company-name=c0kadam",
+        "--product-name=Ceviri Worker",
+        "--file-description=Ceviri Araci Donusum Motoru",
+        ("--product-version={0}" -f $AppVersion),
+        ("--file-version={0}" -f $FileVersion)
+    )
+}
+if ($AssumeYesForDownloads) {
+    $workerNuitkaArgs += "--assume-yes-for-downloads"
+}
+$workerNuitkaArgs += $workerEntryPoint
+Invoke-Checked "python" $workerNuitkaArgs
+
+$workerDistCandidates = @(
+    (Join-Path $BuildRoot "CeviriWorker.dist"),
+    (Join-Path $BuildRoot "conversion_worker_main.dist")
+)
+$workerDist = $workerDistCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
+if (-not $workerDist) {
+    throw "Nuitka worker output not found under: $BuildRoot"
+}
 New-Item -ItemType Directory -Path $FinalDir -Force | Out-Null
 Copy-Item -Path (Join-Path $nuitkaDist "*") -Destination $FinalDir -Recurse -Force
+Copy-Item -Path (Join-Path $workerDist "*") -Destination $FinalDir -Recurse -Force
 
 $releaseOut = Join-Path $FinalDir "release"
 $assetArgs = @(
@@ -304,6 +350,10 @@ foreach ($docName in $releaseDocs) {
 $mainExe = Join-Path $FinalDir "CeviriAraci.exe"
 if (-not (Test-Path -LiteralPath $mainExe -PathType Leaf)) {
     throw "Main executable not found: $mainExe"
+}
+$workerExe = Join-Path $FinalDir "CeviriWorker.exe"
+if (-not (Test-Path -LiteralPath $workerExe -PathType Leaf)) {
+    throw "Conversion worker executable not found: $workerExe"
 }
 
 if (-not $NoZip) {

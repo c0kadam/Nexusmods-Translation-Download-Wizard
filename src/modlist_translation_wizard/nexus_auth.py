@@ -10,7 +10,11 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, Iterator
 from urllib.parse import urlencode
 
-from modlist_translate_tool.nexus.api_client import NexusApiClient, NexusApiResponse
+from modlist_translate_tool.nexus.api_client import (
+    NexusApiClient,
+    NexusApiResponse,
+    NexusRateLimit,
+)
 
 from modlist_translation_wizard.credential_store import CredentialStore
 from modlist_translation_wizard.version import TOOL_NAME, __version__
@@ -185,6 +189,18 @@ def require_premium_api_key(
             "'Ücretsiz / Tarayıcı' indirme yöntemini seçin."
         )
     return response
+
+
+def fetch_official_api_usage(
+    api_key: str,
+    *,
+    client_factory: Callable[[str], NexusApiClient] | None = None,
+) -> NexusRateLimit:
+    """Read Nexus' authoritative quota counters from API response headers."""
+
+    key = _required_api_key(api_key)
+    factory = client_factory or (lambda value: NexusApiClient(value))
+    return factory(key).validate().rate_limit
 
 
 @contextmanager

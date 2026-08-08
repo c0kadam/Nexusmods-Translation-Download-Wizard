@@ -16,6 +16,7 @@ from modlist_translation_wizard.non_premium import (
     next_non_premium_download,
     parse_nxm_download_link,
     run_non_premium_nxm_download,
+    unavailable_non_premium_downloads,
 )
 from modlist_translation_wizard.runtime import plan_downloads_from_manifest
 from tests.test_wizard_manifest import _manifest, _profile
@@ -148,6 +149,51 @@ def test_failed_non_premium_downloads_include_page_url_and_error(tmp_path) -> No
             "last_error": "downloaded_size_mismatch",
         }
     ]
+
+
+def test_unavailable_non_premium_downloads_includes_planned_and_failed(tmp_path) -> None:
+    ready_archive = tmp_path / "ready.zip"
+    ready_archive.write_bytes(b"ready")
+    queue = {
+        "items": [
+            {
+                "status": "READY",
+                "local_archive_path": str(ready_archive),
+                "request": {
+                    "game_domain": "skyrimspecialedition",
+                    "translation_nexus_mod_id": 1,
+                    "translation_file_id": 10,
+                },
+            },
+            {
+                "status": "PLANNED",
+                "local_archive_path": str(tmp_path / "planned.zip"),
+                "request": {
+                    "game_domain": "skyrimspecialedition",
+                    "translation_nexus_mod_id": 2,
+                    "translation_file_id": 20,
+                    "translation_name": "Planned translation",
+                },
+            },
+            {
+                "status": "FAILED",
+                "last_error": "url_error_timeout",
+                "local_archive_path": str(tmp_path / "failed.zip"),
+                "request": {
+                    "game_domain": "skyrimspecialedition",
+                    "translation_nexus_mod_id": 3,
+                    "translation_file_id": 30,
+                    "translation_file_name": "failed.zip",
+                },
+            },
+        ]
+    }
+
+    unavailable = unavailable_non_premium_downloads(queue)
+
+    assert [item["translation_file_id"] for item in unavailable] == [20, 30]
+    assert unavailable[0]["page_url"].endswith("file_id=20&nmm=1")
+    assert unavailable[1]["last_error"] == "url_error_timeout"
 
 
 def test_non_premium_download_uses_nxm_authorization_without_persisting_it(

@@ -56,8 +56,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build_standalone.ps1 -WindowsRe
 
 ```text
 dist\standalone\CeviriAraci.exe
+dist\standalone\CeviriWorker.exe
 dist\standalone.zip
 ```
+
+`CeviriWorker.exe` arka plandaki dönüşüm motorudur; doğrudan çalıştırılmaz ve release
+klasöründen ayrılmamalıdır.
 
 Build betiği, `.7z` ve `.rar` desteği için resmi 7-Zip konsol bileşenlerini
 7-Zip yayınından indirir, sabit SHA-256 değerleriyle doğrular ve

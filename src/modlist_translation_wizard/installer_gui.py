@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import queue
@@ -13,14 +14,16 @@ import webbrowser
 from datetime import datetime, timezone
 from importlib.resources import files
 from io import BytesIO
+from math import ceil
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 from typing import Any, Callable
 
 import customtkinter as ctk
 from PIL import Image, ImageTk, UnidentifiedImageError
 
 from modlist_translate_tool.app.workflow import scan_profile
+from modlist_translate_tool.nexus.api_client import NexusRateLimit
 from modlist_translate_tool.nexus.downloader import urllib_download_to_file
 
 from modlist_translation_wizard.bundled import (
@@ -29,6 +32,7 @@ from modlist_translation_wizard.bundled import (
     clear_default_remote_manifest_cache,
     default_manifest_source_info,
     default_release_info,
+    external_release_dirs,
     load_default_bundled_manifest,
 )
 from modlist_translation_wizard.conversion_worker import run_conversion_in_worker
@@ -38,10 +42,21 @@ from modlist_translation_wizard.credential_store import (
     MemoryCredentialStore,
     WindowsCredentialStore,
 )
+from modlist_translation_wizard.download_cache import (
+    DownloadCacheClearResult,
+    DownloadCacheSummary,
+    clear_download_cache,
+    format_cache_size,
+    inspect_download_cache,
+)
 from modlist_translation_wizard.endorsement import (
+    BulkEndorsementSummary,
     NexusEndorsementError,
-    NexusEndorsementResult,
-    endorse_release_translation,
+    ReleaseEndorsementTarget,
+    collect_manifest_endorsement_targets,
+    endorse_manifest_targets,
+    merge_remaining_endorsement_targets,
+    wait_required_endorsement_targets,
 )
 from modlist_translation_wizard.gui_model import (
     NON_PREMIUM_DELIVERY_LABEL,
@@ -67,6 +82,7 @@ from modlist_translation_wizard.nexus_auth import (
     NexusPremiumRequiredError,
     api_key_status,
     clear_api_key,
+    fetch_official_api_usage,
     load_api_key,
     require_premium_api_key,
     store_manual_api_key,
@@ -76,6 +92,7 @@ from modlist_translation_wizard.non_premium import (
     failed_non_premium_downloads,
     next_non_premium_download,
     run_non_premium_nxm_download,
+    unavailable_non_premium_downloads,
 )
 from modlist_translation_wizard.nxm_capture import (
     NxmCaptureError,
@@ -88,6 +105,10 @@ from modlist_translation_wizard.runtime import (
     plan_downloads_from_manifest,
     run_premium_downloads_from_plan,
 )
+from modlist_translation_wizard.themed_dialog import (
+    show_themed_dialog,
+    show_themed_toast,
+)
 from modlist_translation_wizard.windows_long_paths import (
     WindowsLongPathEnableResult,
     enable_windows_long_paths,
@@ -95,13 +116,97 @@ from modlist_translation_wizard.windows_long_paths import (
 )
 
 
-BANNER_IMAGE_MAX_WIDTH = 820
-BANNER_IMAGE_MAX_HEIGHT = 126
+BANNER_IMAGE_MAX_WIDTH = 1040
+BANNER_IMAGE_MAX_HEIGHT = 138
 BANNER_TEXT_COLUMN_WIDTH = 430
-BANNER_WINDOW_PADDING = 140
+BANNER_WINDOW_PADDING = 120
 C0KADAM_DISCORD_SUPPORT_URL = "https://discordapp.com/users/279006796524421130"
 NEGATRM_DISCORD_SUPPORT_URL = "https://discord.gg/4cHCUGkEP"
-ENDORSE_BUTTON_LABEL = "👍 Endorse Et"
+ENDORSE_BUTTON_LABEL = "👍 Çevirileri Beğen / Endorse Et"
+WINDOWS_APP_USER_MODEL_ID = "c0kadam.NexusmodsTranslationDownloadWizard"
+CONVERSION_RETRY_COOLDOWN_SECONDS = 12
+ENDORSEMENT_AUTO_RETRY_SECONDS = 15 * 60
+ENDORSEMENT_BUSY_RETRY_SECONDS = 30
+
+
+def _configure_windows_app_identity() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(  # type: ignore[attr-defined]
+            WINDOWS_APP_USER_MODEL_ID
+        )
+    except (AttributeError, OSError):
+        return False
+    return True
+
+
+def _packaged_release_icon_path(list_id: str, icon_name: str) -> Path | None:
+    safe_list_id = Path(str(list_id or "")).name
+    safe_icon_name = Path(str(icon_name or "")).name
+    if not safe_list_id or not safe_icon_name:
+        return None
+    candidate = files("modlist_translation_wizard").joinpath(
+        "resources",
+        "releases",
+        safe_list_id,
+        safe_icon_name,
+    )
+    try:
+        return Path(str(candidate)) if candidate.is_file() else None
+    except OSError:
+        return None
+
+
+def _default_release_icon_path() -> Path | None:
+    release_id = str(default_release_info().get("release_id") or "")
+    for release_dir in external_release_dirs(release_id):
+        candidate = release_dir / "icon.ico"
+        if candidate.is_file():
+            return candidate
+    return _packaged_release_icon_path(release_id, "icon.ico")
+
+
+def _apply_window_icon_asset(window: tk.Misc, icon_path: Path) -> ImageTk.PhotoImage | None:
+    try:
+        window.iconbitmap(str(icon_path))  # type: ignore[attr-defined]
+    except (OSError, tk.TclError):
+        pass
+    try:
+        with Image.open(icon_path) as icon:
+            icon_image = icon.convert("RGBA")
+        icon_image.thumbnail((256, 256), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(icon_image)
+        window.iconphoto(True, photo)  # type: ignore[attr-defined]
+    except (OSError, ValueError, UnidentifiedImageError, tk.TclError):
+        return None
+    return photo
+
+
+def _is_conversion_worker_failure(error: BaseException) -> bool:
+    text = str(error).casefold()
+    return (
+        "worker process" in text
+        and ("cikis kodu:" in text or "çıkış kodu:" in text)
+    ) or "workerfailed" in text
+
+
+def _conversion_retry_seconds_remaining(*, ready_at: float, now: float) -> int:
+    return max(0, ceil(float(ready_at) - float(now)))
+
+
+def _endorsement_button_presentation(
+    target_count: int,
+    *,
+    busy: bool,
+) -> tuple[str, bool]:
+    """Return the shared label and enabled state for endorsement actions."""
+
+    if busy:
+        return "Gönderiliyor...", False
+    if target_count <= 0:
+        return "Beğeniler gönderildi", False
+    return ENDORSE_BUTTON_LABEL, True
 
 
 def _banner_title_font_size(title: str) -> int:
@@ -115,9 +220,254 @@ def _banner_title_font_size(title: str) -> int:
     return 16
 
 
-DEFAULT_WINDOW_HEIGHT = 760
+def _archive_path_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _download_item_lookup(queue_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    pending_items = unavailable_non_premium_downloads(queue_payload)
+    total = len(pending_items)
+    pending_by_ids = {
+        (
+            int(item["translation_nexus_mod_id"]),
+            int(item["translation_file_id"]),
+        ): item
+        for item in pending_items
+    }
+    positions = {
+        (
+            int(item["translation_nexus_mod_id"]),
+            int(item["translation_file_id"]),
+        ): position
+        for position, item in enumerate(pending_items, start=1)
+    }
+    for queue_item in queue_payload.get("items", []):
+        if not isinstance(queue_item, dict):
+            continue
+        request = queue_item.get("request") if isinstance(queue_item.get("request"), dict) else {}
+        try:
+            identity = (
+                int(request.get("translation_nexus_mod_id")),
+                int(request.get("translation_file_id")),
+            )
+        except (TypeError, ValueError):
+            continue
+        summary = pending_by_ids.get(identity)
+        archive_path = str(queue_item.get("local_archive_path") or "").strip()
+        if summary is None or not archive_path:
+            continue
+        lookup[_archive_path_key(archive_path)] = {
+            **summary,
+            "position": positions[identity],
+            "total": total,
+        }
+    return lookup
+
+
+def _download_item_for_part_path(
+    part_path: Path,
+    lookup: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    path_text = str(part_path)
+    archive_path = path_text[:-5] if path_text.casefold().endswith(".part") else path_text
+    item = lookup.get(_archive_path_key(archive_path))
+    if item is not None:
+        return item
+    try:
+        identity = (int(part_path.parent.parent.name), int(part_path.parent.name))
+    except (IndexError, TypeError, ValueError):
+        identity = None
+    if identity is not None:
+        for candidate in lookup.values():
+            if (
+                int(candidate["translation_nexus_mod_id"]),
+                int(candidate["translation_file_id"]),
+            ) == identity:
+                return candidate
+    return {
+        "translation_name": "Nexus çeviri dosyası",
+        "translation_file_name": part_path.name.removesuffix(".part"),
+        "translation_nexus_mod_id": "?",
+        "translation_file_id": "?",
+        "position": 1,
+        "total": max(len(lookup), 1),
+    }
+
+
+def _conversion_archive_information(
+    payload: dict[str, Any],
+) -> tuple[tuple[str, str, str], str] | None:
+    archive_text = str(payload.get("archive_path") or "").strip()
+    if not archive_text:
+        return None
+    archive_name = Path(archive_text).name or archive_text
+    stage = str(payload.get("stage") or "")
+    mod_id = str(payload.get("translation_nexus_mod_id") or "?")
+    file_id = str(payload.get("translation_file_id") or "?")
+    display_name = str(payload.get("display_name") or "").strip()
+    if stage == "extracting_add_on_package":
+        position = max(1, int(payload.get("processed_packages") or 1))
+        total = max(1, int(payload.get("total_packages") or 1))
+        action = f"Ek paket çıkarılıyor: {position}/{total}"
+    elif stage == "extracting_native_binary_asset":
+        position = max(1, int(payload.get("processed_assets") or 1))
+        total = max(1, int(payload.get("total_assets") or 1))
+        action = f"Ek dosya çıkarılıyor: {position}/{total}"
+    else:
+        position = max(1, int(payload.get("processed_archives") or 1))
+        total = max(1, int(payload.get("total_archives") or 1))
+        action = f"Arşiv çıkarılıyor ve dönüştürülüyor: {position}/{total}"
+    name_line = f" · {display_name}" if display_name else ""
+    text = f"{action}{name_line}\nArşiv: {archive_name}\nNexus: {mod_id}/{file_id}"
+    return (archive_text.casefold(), mod_id, file_id), text
+
+
+def _format_nexus_api_usage(rate_limit: NexusRateLimit) -> str:
+    hourly = _format_quota_pair(
+        rate_limit.hourly_remaining,
+        rate_limit.hourly_limit,
+    )
+    daily = _format_quota_pair(
+        rate_limit.daily_remaining,
+        rate_limit.daily_limit,
+    )
+    resets = [
+        text
+        for text in (
+            _format_quota_reset("saatlik", rate_limit.hourly_reset),
+            _format_quota_reset("günlük", rate_limit.daily_reset),
+        )
+        if text
+    ]
+    reset_text = f" · Sıfırlama: {', '.join(resets)}" if resets else ""
+    return (
+        f"Resmî Nexus API kotası · Saatlik: {hourly} · Günlük: {daily}"
+        f"{reset_text}"
+    )
+
+
+def _bulk_endorsement_log_summary(result: BulkEndorsementSummary) -> str:
+    return (
+        "Nexus toplu endorse tamamlandı: "
+        f"toplam={result.total}, desteklenen={result.completed}, "
+        f"yeni={result.endorsed}, zaten={result.already_endorsed}, "
+        f"15dk_bekleyen={result.wait_required}, hata={result.failed}, "
+        f"geçici_hata={result.transient_error}, kota={result.rate_limited}, "
+        f"denenmeyen={result.not_attempted}."
+    )
+
+
+def _bulk_endorsement_user_message(
+    result: BulkEndorsementSummary,
+    *,
+    auto_retry_scheduled: bool = False,
+) -> str:
+    lines = [
+        "Çeviri sayfalarını beğenme (endorse) işlemi tamamlandı.",
+        "",
+        f"Desteklenen sayfa: {result.completed}/{result.total}",
+    ]
+    if result.endorsed:
+        lines.append(f"Yeni endorse edilen: {result.endorsed}")
+    if result.already_endorsed:
+        lines.append(f"Zaten endorse edilmiş: {result.already_endorsed}")
+    if result.wait_required:
+        lines.extend(
+            [
+                "",
+                (
+                    f"{result.wait_required} sayfa, Nexus'un 15 dakika bekleme "
+                    "süresi nedeniyle endorse edilemedi."
+                ),
+            ]
+        )
+        if auto_retry_scheduled:
+            lines.append(
+                "Araç açık kalırsa bu sayfalar 15 dakika sonra arka planda "
+                "otomatik olarak yeniden denenecek."
+            )
+        else:
+            lines.append(
+                "Bu sayfaları daha sonra Çevirileri Beğen düğmesiyle yeniden "
+                "deneyebilirsiniz."
+            )
+    if result.rate_limited:
+        lines.append("Nexus API kotası nedeniyle işlem durdu; kota yenilenince tekrar deneyin.")
+    if result.transient_error:
+        lines.append("Geçici bir Nexus bağlantı sorunu nedeniyle işlem durdu.")
+    if result.unauthorized:
+        lines.append("API anahtarı endorse yetkisine sahip değil veya geçersiz görünüyor.")
+    if result.not_attempted:
+        lines.append(f"Bu nedenle {result.not_attempted} sayfa henüz denenmedi.")
+    if result.disabled or result.own_file or result.abstained or result.failed:
+        lines.append(
+            "Bazı sayfalar Nexus kuralları veya sayfa ayarları nedeniyle atlandı."
+        )
+    lines.extend(
+        [
+            "",
+            (
+                "Verdiğiniz beğeniler çevirmenlerin emeğini daha görünür kılacak "
+                "ve gelecekteki çalışmalar için değerli bir motivasyon sağlayacaktır."
+            ),
+            "Katkınız için teşekkür ederiz. İyi oyunlar.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_quota_pair(remaining: int | None, limit: int | None) -> str:
+    if remaining is None and limit is None:
+        return "bilinmiyor"
+    remaining_text = _format_quota_number(remaining)
+    if limit is None:
+        return remaining_text
+    return f"{remaining_text} / {_format_quota_number(limit)}"
+
+
+def _format_quota_number(value: int | None) -> str:
+    if value is None:
+        return "?"
+    return f"{max(0, int(value)):,}".replace(",", ".")
+
+
+def _format_quota_reset(label: str, timestamp: int | None) -> str:
+    if timestamp is None:
+        return ""
+    try:
+        value = datetime.fromtimestamp(int(timestamp), tz=timezone.utc).astimezone()
+    except (OSError, OverflowError, ValueError):
+        return ""
+    return f"{label} {value:%H:%M}"
+
+
+def _initial_window_size(
+    *,
+    preferred_width: int,
+    required_width: int,
+    required_height: int,
+    screen_width: int,
+    screen_height: int,
+) -> tuple[int, int]:
+    available_width = max(760, int(screen_width) - 72)
+    available_height = max(640, int(screen_height) - 96)
+    width = min(
+        max(MIN_WINDOW_WIDTH, int(preferred_width), int(required_width)),
+        available_width,
+        MAX_WINDOW_WIDTH,
+    )
+    height = min(
+        max(MIN_WINDOW_HEIGHT, DEFAULT_WINDOW_HEIGHT, int(required_height)),
+        available_height,
+    )
+    return width, height
+
+
+DEFAULT_WINDOW_HEIGHT = 980
+MIN_WINDOW_HEIGHT = 740
 MIN_WINDOW_WIDTH = 1040
-MAX_WINDOW_WIDTH = 1500
+MAX_WINDOW_WIDTH = 1750
 MANIFEST_MODE_OTA_LABEL = "OTA (Güncel)"
 MANIFEST_MODE_LOCAL_LABEL = "Yerel"
 
@@ -146,6 +496,13 @@ class ModlistTranslationInstallerApp:
         self.summary = manifest_summary(self.manifest)
         self.branding = load_release_branding(self.manifest)
         self.endorsement_target = self.branding.endorsement
+        self.endorsement_targets = collect_manifest_endorsement_targets(
+            self.manifest,
+            extra_targets=(
+                [self.endorsement_target] if self.endorsement_target is not None else []
+            ),
+        )
+        self.endorsement_available = bool(self.endorsement_targets)
         self.app_id = self.summary["registered_app_id"]
         self.store: CredentialStore = _create_credential_store()
         self.window_icon_photo: ImageTk.PhotoImage | None = None
@@ -154,7 +511,7 @@ class ModlistTranslationInstallerApp:
         self._apply_window_icon()
         initial_width = self._initial_window_width()
         self.root.geometry(f"{initial_width}x{DEFAULT_WINDOW_HEIGHT}")
-        self.root.minsize(MIN_WINDOW_WIDTH, 640)
+        self.root.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
 
         self.delivery_mode = tk.StringVar(value=PREMIUM_DELIVERY_LABEL)
         self.api_key = tk.StringVar()
@@ -163,8 +520,14 @@ class ModlistTranslationInstallerApp:
         self.status_text = tk.StringVar(value="Hazır.")
         self.profile_status_text = tk.StringVar(value="Modlist klasörü seçin.")
         self.auth_status_text = tk.StringVar(value="Nexus API anahtarı kontrol ediliyor.")
+        self.api_usage_text = tk.StringVar(
+            value="Resmî Nexus API kotası için API anahtarınızı kaydedin."
+        )
         self.long_paths_status_text = tk.StringVar(value="Windows ayarı kontrol ediliyor.")
         self.download_status_text = tk.StringVar(value="Profil hazırlanınca indirme açılır.")
+        self.current_download_text = tk.StringVar(
+            value="İndirme veya hazırlama başlayınca işlem bilgisi burada görünür."
+        )
         self.prepare_status_text = tk.StringVar(
             value="Çeviri hazırlanınca çıktı klasöründe oluşur."
         )
@@ -182,8 +545,8 @@ class ModlistTranslationInstallerApp:
         self.manifest_source_text = tk.StringVar(value=source_text)
         self.endorsement_status_text = tk.StringVar(
             value=(
-                "Çeviri sayfasını Nexus'ta destekleyin."
-                if self.endorsement_target is not None
+                f"{len(self.endorsement_targets)} Nexus çeviri sayfasını beğenebilirsiniz."
+                if self.endorsement_targets
                 else ""
             )
         )
@@ -196,11 +559,17 @@ class ModlistTranslationInstallerApp:
         self.non_premium_download_result: Any | None = None
         self.conversion_result: Any | None = None
         self.premium_api_validated = False
+        self.use_manifest_download_cache_roots = True
         self.pending_nxm_url: str | None = None
         self.nxm_capture_server: NxmCaptureServer | None = None
         self.nxm_protocol_binding = WindowsNxmProtocolBinding()
         self.task_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.busy = False
+        self.endorsement_busy = False
+        self._endorsement_retry_after: str | None = None
+        self._endorsement_retry_due_at = 0.0
+        self._endorsement_retry_targets: tuple[ReleaseEndorsementTarget, ...] = ()
+        self.api_usage_busy = False
         self._busy_progress_after: str | None = None
         self._busy_progress_label = ""
         self._busy_progress_cap = 0
@@ -213,10 +582,17 @@ class ModlistTranslationInstallerApp:
         self._eta_progress_base = 0
         self._eta_progress_span = 0
         self._eta_status_path: Path | None = None
+        self._last_conversion_archive_key: tuple[str, str, str] | None = None
+        self._conversion_retry_after: str | None = None
+        self._conversion_retry_ready_at = 0.0
         self.banner_image: ctk.CTkImage | None = None
         self.discord_support_icon: ctk.CTkImage | None = None
         self.endorsement_button: ctk.CTkButton | None = None
+        self.completion_endorsement_button: ctk.CTkButton | None = None
         self.completion_popup: ctk.CTkToplevel | None = None
+        self.download_recovery_popup: ctk.CTkToplevel | None = None
+        self.download_cache_popup: ctk.CTkToplevel | None = None
+        self.active_toast: ctk.CTkFrame | None = None
 
         try:
             self.nxm_protocol_binding.recover_stale_binding()
@@ -225,11 +601,13 @@ class ModlistTranslationInstallerApp:
 
         self._configure_style()
         self._build()
+        self._fit_initial_window_to_content(initial_width)
         self._refresh_windows_long_paths_status()
         self._refresh_auth_status()
         self._refresh_pipeline_buttons()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.root.after(100, self._poll_task_queue)
+        self.root.after(350, lambda: self._refresh_api_usage(silent=True))
 
     def _configure_style(self) -> None:
         ctk.set_appearance_mode("dark")
@@ -254,22 +632,78 @@ class ModlistTranslationInstallerApp:
         }
         self.root.configure(fg_color=self.colors["bg"])
 
+    def _notify(
+        self,
+        title: str,
+        message: str,
+        *,
+        tone: str = "info",
+        action_label: str = "Anladım",
+        parent: tk.Misc | None = None,
+    ) -> None:
+        show_themed_dialog(
+            parent or self.root,
+            palette=self.colors,
+            title=title,
+            message=message,
+            tone=tone,
+            primary_label=action_label,
+        )
+
+    def _confirm(
+        self,
+        title: str,
+        message: str,
+        *,
+        action_label: str,
+        cancel_label: str = "Vazgeç",
+        tone: str = "question",
+        parent: tk.Misc | None = None,
+    ) -> bool:
+        return show_themed_dialog(
+            parent or self.root,
+            palette=self.colors,
+            title=title,
+            message=message,
+            tone=tone,
+            primary_label=action_label,
+            secondary_label=cancel_label,
+        )
+
+    def _toast(
+        self,
+        title: str,
+        message: str,
+        *,
+        tone: str = "info",
+        duration_ms: int = 6500,
+    ) -> None:
+        if self.active_toast is not None and self.active_toast.winfo_exists():
+            self.active_toast.destroy()
+        self.active_toast = show_themed_toast(
+            self.root,
+            palette=self.colors,
+            title=title,
+            message=message,
+            tone=tone,
+            duration_ms=duration_ms,
+        )
+
     def _apply_window_icon(self) -> None:
         icon_path = release_branding_asset_path(self.manifest, self.branding.icon)
         if icon_path is None:
+            modlist = (
+                self.manifest.get("modlist")
+                if isinstance(self.manifest.get("modlist"), dict)
+                else {}
+            )
+            icon_path = _packaged_release_icon_path(
+                str(modlist.get("id") or ""),
+                str(self.branding.icon or "icon.ico"),
+            )
+        if icon_path is None:
             return
-        try:
-            self.root.iconbitmap(default=str(icon_path))
-        except (OSError, tk.TclError):
-            pass
-        try:
-            with Image.open(icon_path) as icon:
-                icon_image = icon.copy()
-            icon_image.thumbnail((256, 256), Image.Resampling.LANCZOS)
-            self.window_icon_photo = ImageTk.PhotoImage(icon_image)
-            self.root.iconphoto(True, self.window_icon_photo)
-        except (OSError, ValueError, UnidentifiedImageError, tk.TclError):
-            pass
+        self.window_icon_photo = _apply_window_icon_asset(self.root, icon_path)
 
     def _build(self) -> None:
         shell = ctk.CTkScrollableFrame(
@@ -395,6 +829,19 @@ class ModlistTranslationInstallerApp:
         width = image_size[0] + BANNER_TEXT_COLUMN_WIDTH + BANNER_WINDOW_PADDING
         return max(MIN_WINDOW_WIDTH, min(MAX_WINDOW_WIDTH, width))
 
+    def _fit_initial_window_to_content(self, preferred_width: int) -> None:
+        self.root.update_idletasks()
+        width, height = _initial_window_size(
+            preferred_width=preferred_width,
+            required_width=self.root.winfo_reqwidth(),
+            required_height=self.root.winfo_reqheight(),
+            screen_width=self.root.winfo_screenwidth(),
+            screen_height=self.root.winfo_screenheight(),
+        )
+        x = max(0, (self.root.winfo_screenwidth() - width) // 2)
+        y = max(0, (self.root.winfo_screenheight() - height) // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
     def _banner_display_size(self) -> tuple[int, int] | None:
         banner_bytes = release_branding_asset_bytes(self.manifest, self.branding.banner)
         if not banner_bytes:
@@ -489,7 +936,7 @@ class ModlistTranslationInstallerApp:
             font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
         )
         self.manifest_source_label.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
-        if self.endorsement_target is not None:
+        if self.endorsement_targets:
             ctk.CTkFrame(
                 self.manifest_source_frame,
                 height=1,
@@ -519,7 +966,7 @@ class ModlistTranslationInstallerApp:
                 text_color=("#ffffff", "#ffffff"),
                 corner_radius=9,
                 height=38,
-                width=132,
+                width=210,
                 font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
             )
             self.endorsement_button.grid(row=0, column=1, sticky="e")
@@ -610,7 +1057,11 @@ class ModlistTranslationInstallerApp:
             return
         if self.busy:
             self.manifest_mode_control.set(self._manifest_mode_label())
-            messagebox.showinfo("İşlem sürüyor", "Manifest kaynağı işlem tamamlanınca değiştirilebilir.")
+            self._toast(
+                "İşlem hâlâ devam ediyor",
+                "Çeviri listesi kaynağını mevcut işlem tamamlandıktan sonra değiştirebilirsiniz.",
+                tone="info",
+            )
             return
 
         self.manifest_mode.set(requested_mode)
@@ -643,8 +1094,28 @@ class ModlistTranslationInstallerApp:
                 return
 
             self.manifest = result["manifest"]
+            self._cancel_endorsement_auto_retry()
             self.manifest_source_info = dict(result["source_info"])
             self.summary = manifest_summary(self.manifest)
+            self.branding = load_release_branding(self.manifest)
+            self.endorsement_target = self.branding.endorsement
+            self.endorsement_targets = collect_manifest_endorsement_targets(
+                self.manifest,
+                extra_targets=(
+                    [self.endorsement_target]
+                    if self.endorsement_target is not None
+                    else []
+                ),
+            )
+            self.endorsement_available = bool(self.endorsement_targets)
+            self.endorsement_status_text.set(
+                (
+                    f"{len(self.endorsement_targets)} Nexus çeviri sayfasını beğenebilirsiniz."
+                    if self.endorsement_targets
+                    else ""
+                )
+            )
+            self._sync_endorsement_buttons()
             self.app_id = self.summary["registered_app_id"]
             self.release_summary_text.set(self._release_summary_display())
             source_text, source_tone = self._manifest_source_notice()
@@ -820,14 +1291,15 @@ class ModlistTranslationInstallerApp:
             text_color=self.colors["text"],
             anchor="w",
         ).grid(row=5, column=0, sticky="w", padx=(18, 10), pady=(12, 6))
-        ctk.CTkEntry(
+        self.api_key_entry = ctk.CTkEntry(
             main,
             textvariable=self.api_key,
             show="*",
             corner_radius=8,
             fg_color=self.colors["panel_alt"],
             border_color=self.colors["line"],
-        ).grid(row=5, column=1, sticky="ew", pady=(12, 6))
+        )
+        self.api_key_entry.grid(row=5, column=1, sticky="ew", pady=(12, 6))
         api_actions = ctk.CTkFrame(main, fg_color="transparent")
         api_actions.grid(
             row=5,
@@ -882,12 +1354,56 @@ class ModlistTranslationInstallerApp:
 
         ctk.CTkLabel(
             main,
+            text="API kullanım durumu",
+            text_color=self.colors["text"],
+            anchor="w",
+        ).grid(row=7, column=0, sticky="w", padx=(18, 10), pady=(6, 8))
+        api_usage_frame = ctk.CTkFrame(
+            main,
+            fg_color=self.colors["panel_alt"],
+            corner_radius=9,
+            border_width=1,
+            border_color=self.colors["line"],
+        )
+        api_usage_frame.grid(
+            row=7,
+            column=1,
+            columnspan=3,
+            sticky="ew",
+            padx=(0, 18),
+            pady=(6, 8),
+        )
+        api_usage_frame.columnconfigure(0, weight=1)
+        self.api_usage_label = ctk.CTkLabel(
+            api_usage_frame,
+            textvariable=self.api_usage_text,
+            text_color=self.colors["muted"],
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=880,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+        )
+        self.api_usage_label.grid(row=0, column=0, sticky="ew", padx=12, pady=9)
+        self.api_usage_refresh_button = ctk.CTkButton(
+            api_usage_frame,
+            text="Yenile",
+            command=self._refresh_api_usage,
+            corner_radius=8,
+            fg_color=self.colors["button"],
+            hover_color=self.colors["button_hover"],
+            width=76,
+            height=30,
+        )
+        self.api_usage_refresh_button.grid(row=0, column=1, sticky="e", padx=(6, 9), pady=6)
+
+        ctk.CTkLabel(
+            main,
             text="İndirme yöntemi",
             text_color=self.colors["text"],
             anchor="w",
-        ).grid(row=7, column=0, sticky="w", padx=(18, 10), pady=(12, 8))
+        ).grid(row=8, column=0, sticky="w", padx=(18, 10), pady=(12, 8))
         methods = ctk.CTkFrame(main, fg_color="transparent")
-        methods.grid(row=7, column=1, columnspan=3, sticky="w", pady=(12, 8))
+        methods.grid(row=8, column=1, columnspan=3, sticky="w", pady=(12, 8))
         ctk.CTkRadioButton(
             methods,
             text=PREMIUM_DELIVERY_LABEL,
@@ -946,7 +1462,7 @@ class ModlistTranslationInstallerApp:
         ).pack(side=tk.LEFT, padx=(4, 0))
 
         self.nxm_frame = ctk.CTkFrame(main, fg_color="transparent")
-        self.nxm_frame.grid(row=8, column=0, columnspan=4, sticky="ew", padx=18, pady=(6, 16))
+        self.nxm_frame.grid(row=9, column=0, columnspan=4, sticky="ew", padx=18, pady=(6, 16))
         self.nxm_frame.columnconfigure(1, weight=1)
         ctk.CTkLabel(
             self.nxm_frame,
@@ -1002,15 +1518,27 @@ class ModlistTranslationInstallerApp:
             font=self.status_label_default_font,
         )
         self.status_label.grid(row=0, column=0, sticky="w", padx=18, pady=(16, 6))
+        action_tools = ctk.CTkFrame(actions, fg_color="transparent")
+        action_tools.grid(row=0, column=1, sticky="e", padx=18, pady=(16, 6))
+        self.download_cache_button = ctk.CTkButton(
+            action_tools,
+            text="İndirme arşivleri",
+            command=self._show_download_cache_manager,
+            corner_radius=8,
+            fg_color=self.colors["button"],
+            hover_color=self.colors["button_hover"],
+            width=142,
+        )
+        self.download_cache_button.pack(side=tk.LEFT, padx=(0, 8))
         self.details_button = ctk.CTkButton(
-            actions,
+            action_tools,
             text="Detayları göster",
             command=self._toggle_details,
             corner_radius=8,
             fg_color=self.colors["button"],
             hover_color=self.colors["button_hover"],
         )
-        self.details_button.grid(row=0, column=1, sticky="e", padx=18, pady=(16, 6))
+        self.details_button.pack(side=tk.LEFT)
         progress_row = ctk.CTkFrame(actions, fg_color="transparent")
         progress_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(6, 2))
         progress_row.columnconfigure(0, weight=1)
@@ -1047,6 +1575,37 @@ class ModlistTranslationInstallerApp:
             font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
         )
         self.eta_label.grid(row=2, column=1, sticky="e", padx=(8, 18))
+        current_download = ctk.CTkFrame(
+            actions,
+            fg_color=self.colors["panel_alt"],
+            corner_radius=10,
+            border_width=1,
+            border_color=self.colors["line"],
+        )
+        current_download.grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=18,
+            pady=(12, 0),
+        )
+        ctk.CTkLabel(
+            current_download,
+            text="İşlem bilgisi",
+            text_color=self.colors["muted"],
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+        ).pack(fill=tk.X, padx=12, pady=(8, 1))
+        ctk.CTkLabel(
+            current_download,
+            textvariable=self.current_download_text,
+            text_color=self.colors["text"],
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=1060,
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+        ).pack(fill=tk.X, padx=12, pady=(0, 9))
         self.download_button = ctk.CTkButton(
             actions,
             text="Çevirileri indir",
@@ -1057,7 +1616,7 @@ class ModlistTranslationInstallerApp:
             hover_color=self.colors["button_hover"],
             height=42,
         )
-        self.download_button.grid(row=3, column=0, sticky="ew", padx=(18, 8), pady=(14, 0))
+        self.download_button.grid(row=4, column=0, sticky="ew", padx=(18, 8), pady=(14, 0))
         self.prepare_button = ctk.CTkButton(
             actions,
             text="Çeviriyi hazırla",
@@ -1068,14 +1627,14 @@ class ModlistTranslationInstallerApp:
             hover_color=self.colors["accent_hover"],
             height=42,
         )
-        self.prepare_button.grid(row=3, column=1, sticky="ew", padx=(8, 18), pady=(14, 0))
+        self.prepare_button.grid(row=4, column=1, sticky="ew", padx=(8, 18), pady=(14, 0))
         ctk.CTkLabel(
             actions,
             textvariable=self.download_status_text,
             text_color=self.colors["muted"],
             anchor="w",
             font=ctk.CTkFont(family="Segoe UI", size=12),
-        ).grid(row=4, column=0, sticky="ew", padx=(18, 8), pady=(8, 16))
+        ).grid(row=5, column=0, sticky="ew", padx=(18, 8), pady=(8, 16))
         self.prepare_status_label = ctk.CTkLabel(
             actions,
             textvariable=self.prepare_status_text,
@@ -1083,7 +1642,7 @@ class ModlistTranslationInstallerApp:
             anchor="w",
             font=ctk.CTkFont(family="Segoe UI", size=12),
         )
-        self.prepare_status_label.grid(row=4, column=1, sticky="ew", padx=(8, 18), pady=(8, 16))
+        self.prepare_status_label.grid(row=5, column=1, sticky="ew", padx=(8, 18), pady=(8, 16))
         self.details_frame = ctk.CTkFrame(actions, fg_color="transparent")
         self.details_frame.columnconfigure(0, weight=1)
         self.details_frame.rowconfigure(0, weight=1)
@@ -1257,31 +1816,63 @@ class ModlistTranslationInstallerApp:
                 api_key=self.api_key.get(),
             )
         except Exception as exc:  # noqa: BLE001 - GUI boundary reports sanitized text.
-            messagebox.showerror("API kaydedilemedi", str(exc))
+            self._notify(
+                "API anahtarı kaydedilemedi",
+                str(exc),
+                tone="danger",
+                action_label="API alanına dön",
+            )
             return
         self.api_key.set("")
         self.premium_api_validated = False
         self._log("Nexus API anahtarı kaydedildi.")
         self._refresh_auth_status()
+        self._refresh_api_usage()
+
+    def _show_api_required(self, purpose: str = "Bu işleme devam etmek") -> None:
+        self.auth_status_text.set("Devam etmek için Nexus API anahtarınızı kaydedin.")
+        if hasattr(self, "auth_status_label"):
+            self.auth_status_label.configure(text_color=self.colors["warning"])
+        self._toast(
+            "Nexus API anahtarı gerekli",
+            f"{purpose} için Nexus API anahtarınızı girip Kaydet düğmesine basın.",
+            tone="warning",
+        )
+        if hasattr(self, "api_key_entry"):
+            self.api_key_entry.focus_set()
 
     def _clear_api_key(self) -> None:
         if not self._api_key():
+            self._cancel_endorsement_auto_retry()
             self.api_key.set("")
+            self.api_usage_text.set("Resmî Nexus API kotası için API anahtarınızı kaydedin.")
+            if hasattr(self, "api_usage_label"):
+                self.api_usage_label.configure(text_color=self.colors["muted"])
             self._refresh_auth_status()
             return
-        confirmed = messagebox.askyesno(
+        confirmed = self._confirm(
             "API anahtarını sil",
             "Kaydedilmiş Nexus API anahtarı bu bilgisayardan silinsin mi?",
+            action_label="Anahtarı sil",
+            tone="warning",
         )
         if not confirmed:
             return
         try:
             clear_api_key(self.store, app_id=self.app_id)
         except Exception as exc:  # noqa: BLE001 - GUI boundary reports sanitized text.
-            messagebox.showerror("API anahtarı silinemedi", str(exc))
+            self._notify(
+                "API anahtarı silinemedi",
+                str(exc),
+                tone="danger",
+            )
             return
         self.api_key.set("")
         self.premium_api_validated = False
+        self._cancel_endorsement_auto_retry()
+        self.api_usage_text.set("Resmî Nexus API kotası için API anahtarınızı kaydedin.")
+        if hasattr(self, "api_usage_label"):
+            self.api_usage_label.configure(text_color=self.colors["muted"])
         self._log("Kaydedilmiş Nexus API anahtarı silindi.")
         self._refresh_auth_status()
 
@@ -1294,43 +1885,242 @@ class ModlistTranslationInstallerApp:
     def _open_negatrm_discord(self) -> None:
         webbrowser.open(NEGATRM_DISCORD_SUPPORT_URL, new=2, autoraise=True)
 
-    def _endorse_release(self) -> None:
-        target = self.endorsement_target
-        button = self.endorsement_button
-        if target is None or button is None:
+    def _endorsement_buttons(self) -> tuple[ctk.CTkButton, ...]:
+        buttons: list[ctk.CTkButton] = []
+        for button in (
+            self.endorsement_button,
+            self.completion_endorsement_button,
+        ):
+            if button is not None and button.winfo_exists():
+                buttons.append(button)
+        return tuple(buttons)
+
+    def _sync_endorsement_buttons(self) -> None:
+        text, enabled = _endorsement_button_presentation(
+            len(self.endorsement_targets),
+            busy=self.endorsement_busy,
+        )
+        for button in self._endorsement_buttons():
+            button.configure(
+                text=text,
+                state=(tk.NORMAL if enabled else tk.DISABLED),
+                fg_color=self.colors["premium"],
+                hover_color="#ffad4d",
+            )
+
+    def _cancel_endorsement_auto_retry(self) -> None:
+        if self._endorsement_retry_after is not None:
+            try:
+                self.root.after_cancel(self._endorsement_retry_after)
+            except tk.TclError:
+                pass
+        self._endorsement_retry_after = None
+        self._endorsement_retry_due_at = 0.0
+        self._endorsement_retry_targets = ()
+
+    def _schedule_endorsement_auto_retry(
+        self,
+        targets: tuple[ReleaseEndorsementTarget, ...],
+    ) -> bool:
+        self._cancel_endorsement_auto_retry()
+        if not targets:
+            return False
+        self._endorsement_retry_targets = targets
+        self._endorsement_retry_due_at = time.monotonic() + ENDORSEMENT_AUTO_RETRY_SECONDS
+        self._update_endorsement_auto_retry()
+        return True
+
+    def _update_endorsement_auto_retry(self) -> None:
+        self._endorsement_retry_after = None
+        targets = self._endorsement_retry_targets
+        if not targets:
             return
-        if self.busy:
-            messagebox.showinfo("İşlem sürüyor", "Devam eden işlem tamamlandıktan sonra tekrar deneyin.")
+        remaining = max(0, ceil(self._endorsement_retry_due_at - time.monotonic()))
+        if remaining > 0:
+            minutes, seconds = divmod(remaining, 60)
+            self.endorsement_status_text.set(
+                f"{len(targets)} sayfa {minutes:02d}:{seconds:02d} sonra otomatik "
+                "yeniden denenecek. Aracı açık bırakabilirsiniz."
+            )
+            self._endorsement_retry_after = self.root.after(
+                1000,
+                self._update_endorsement_auto_retry,
+            )
+            return
+        if self.busy or self.endorsement_busy:
+            self._endorsement_retry_due_at = (
+                time.monotonic() + ENDORSEMENT_BUSY_RETRY_SECONDS
+            )
+            self.endorsement_status_text.set(
+                "Otomatik beğeni denemesi devam eden işlem tamamlanınca başlayacak."
+            )
+            self._endorsement_retry_after = self.root.after(
+                1000,
+                self._update_endorsement_auto_retry,
+            )
             return
         api_key = self._api_key()
         if not api_key:
-            messagebox.showwarning(
-                "API anahtarı gerekli",
-                "Endorse etmek için önce Nexus API anahtarınızı kaydedin.",
+            self._cancel_endorsement_auto_retry()
+            self.endorsement_status_text.set(
+                "Otomatik beğeni denemesi için kayıtlı Nexus API anahtarı bulunamadı."
             )
             return
+        self._endorsement_retry_after = None
+        self._endorsement_retry_due_at = 0.0
+        self._endorsement_retry_targets = ()
+        self._start_endorsement_attempt(
+            api_key,
+            targets,
+            automatic_retry=True,
+        )
 
-        button.configure(text="Gönderiliyor...", state=tk.DISABLED)
-        self.endorsement_status_text.set("Nexus endorsement gönderiliyor...")
+    def _endorse_release(self, *, parent: tk.Misc | None = None) -> None:
+        targets = self.endorsement_targets
+        if not targets or self.endorsement_busy:
+            return
+        api_key = self._api_key()
+        if not api_key:
+            if parent is not None and parent.winfo_exists():
+                self._notify(
+                    "Nexus API anahtarı gerekli",
+                    (
+                        "Çeviri sayfalarını beğenmek için Nexus API anahtarınızı "
+                        "ana ekrandaki alana girip Kaydet düğmesine basın."
+                    ),
+                    tone="warning",
+                    action_label="Anladım",
+                    parent=parent,
+                )
+            else:
+                self._show_api_required("Çeviri sayfalarını beğenmek")
+            return
+
+        if not self._confirm(
+            "Çevirileri beğen / endorse et",
+            (
+                f"Bu işlem {len(targets)} tekil Nexus çeviri sayfasına "
+                "hesabınızla endorse göndermeyi deneyecek.\n\n"
+                "Bu bir bağış veya ödeme işlemi değildir.\n\n"
+                "Nexus kuralları gereği yalnızca indirilmiş ve üzerinden "
+                "en az 15 dakika geçmiş dosyalar kabul edilir. Bekleme süresine "
+                "takılan sayfalar, araç açık kalırsa 15 dakika sonra otomatik "
+                "olarak yeniden denenecek.\n\n"
+                "İşlem arka planda sürer; aracı arka plana alıp oyuna "
+                "başlayabilirsiniz. Devam edilsin mi?"
+            ),
+            action_label="Beğenileri gönder",
+            cancel_label="Şimdi değil",
+            parent=parent,
+        ):
+            return
+
+        self._cancel_endorsement_auto_retry()
+        self._start_endorsement_attempt(api_key, targets, automatic_retry=False)
+
+    def _start_endorsement_attempt(
+        self,
+        api_key: str,
+        targets: tuple[ReleaseEndorsementTarget, ...],
+        *,
+        automatic_retry: bool,
+    ) -> None:
+        self.endorsement_busy = True
+        self._sync_endorsement_buttons()
+        self.endorsement_status_text.set(
+            "15 dakika bekleyen sayfalar otomatik yeniden deneniyor."
+            if automatic_retry
+            else "Beğeniler gönderiliyor; işlem arka planda devam ediyor."
+        )
 
         def work() -> dict[str, object]:
+            def progress(
+                done_count: int,
+                total_count: int,
+                target: ReleaseEndorsementTarget,
+                status: str,
+                message: str,
+            ) -> None:
+                self.task_queue.put(
+                    (
+                        "endorsement_progress",
+                        {
+                            "done": done_count,
+                            "total": total_count,
+                            "target": target,
+                            "status": status,
+                            "message": message,
+                        },
+                    )
+                )
+
             try:
-                return {"result": endorse_release_translation(api_key, target)}
+                return {
+                    "result": endorse_manifest_targets(
+                        api_key,
+                        targets,
+                        progress_callback=progress,
+                    )
+                }
             except Exception as exc:  # noqa: BLE001 - converted to a user-facing GUI result.
                 return {"error": exc}
 
         def done(payload: dict[str, object]) -> None:
+            notification_parent = (
+                self.completion_popup
+                if self.completion_popup is not None
+                and self.completion_popup.winfo_exists()
+                else None
+            )
             result = payload.get("result")
-            if isinstance(result, NexusEndorsementResult):
-                button.configure(
-                    text="✓ Endorse Edildi",
-                    state=tk.DISABLED,
-                    fg_color=self.colors["success"],
-                    hover_color=self.colors["success"],
+            if isinstance(result, BulkEndorsementSummary):
+                self.endorsement_targets = merge_remaining_endorsement_targets(
+                    self.endorsement_targets,
+                    targets,
+                    result,
                 )
-                self.endorsement_status_text.set("Teşekkürler, endorsement Nexus'a gönderildi.")
-                self._log(
-                    f"Nexus endorsement tamamlandı: {target.game_domain}/{target.mod_id}."
+                wait_targets = wait_required_endorsement_targets(result)
+                auto_retry_scheduled = (
+                    not automatic_retry
+                    and self._schedule_endorsement_auto_retry(wait_targets)
+                )
+                self._sync_endorsement_buttons()
+                self._log(_bulk_endorsement_log_summary(result))
+                if automatic_retry:
+                    if result.wait_required:
+                        self.endorsement_status_text.set(
+                            f"Otomatik deneme tamamlandı; {result.wait_required} sayfa "
+                            "hâlâ bekleme süresinde. Daha sonra elle deneyebilirsiniz."
+                        )
+                    elif self.endorsement_targets:
+                        self.endorsement_status_text.set(
+                            f"Otomatik deneme tamamlandı; {len(self.endorsement_targets)} "
+                            "sayfa elle yeniden denenebilir."
+                        )
+                    else:
+                        self.endorsement_status_text.set(
+                            "Otomatik beğeni denemesi tamamlandı."
+                        )
+                    return
+                if not auto_retry_scheduled:
+                    if self.endorsement_targets:
+                        self.endorsement_status_text.set(
+                            f"Beğeni işlemi tamamlandı: {result.completed}/{result.total}; "
+                            f"{len(self.endorsement_targets)} sayfa yeniden denenebilir."
+                        )
+                    else:
+                        self.endorsement_status_text.set(
+                            f"Beğeni işlemi tamamlandı: {result.completed}/{result.total}."
+                        )
+                self._notify(
+                    "Çeviriler beğenildi",
+                    _bulk_endorsement_user_message(
+                        result,
+                        auto_retry_scheduled=auto_retry_scheduled,
+                    ),
+                    tone=("success" if not self.endorsement_targets else "info"),
+                    action_label="Tamam",
+                    parent=notification_parent,
                 )
                 return
 
@@ -1340,17 +2130,72 @@ class ModlistTranslationInstallerApp:
                 if isinstance(error, NexusEndorsementError)
                 else "Nexus endorse işlemi tamamlanamadı. Daha sonra tekrar deneyin."
             )
-            button.configure(
-                text=ENDORSE_BUTTON_LABEL,
-                state=tk.NORMAL,
-                fg_color=self.colors["premium"],
-                hover_color="#ffad4d",
+            self._sync_endorsement_buttons()
+            self.endorsement_status_text.set(
+                "Otomatik beğeni denemesi tamamlanamadı; daha sonra elle deneyebilirsiniz."
+                if automatic_retry
+                else "Beğeniler gönderilemedi; tekrar deneyebilirsiniz."
             )
-            self.endorsement_status_text.set("Endorse gönderilemedi; tekrar deneyebilirsiniz.")
             self._log(f"Nexus endorsement başarısız: {message}")
-            messagebox.showerror("Endorse işlemi başarısız", message)
+            if automatic_retry:
+                return
+            self._notify(
+                "Beğeni işlemi tamamlanamadı",
+                message,
+                tone="danger",
+                action_label="Daha sonra dene",
+                parent=notification_parent,
+            )
 
-        self._run_task("Nexus endorsement gönderiliyor", work, done)
+        self._run_auxiliary_task("endorsement_done", work, done)
+
+    def _refresh_api_usage(self, *, silent: bool = False) -> None:
+        if self.api_usage_busy:
+            return
+        api_key = self._api_key()
+        if not api_key:
+            self.api_usage_text.set("Resmî Nexus API kotası için API anahtarınızı kaydedin.")
+            if hasattr(self, "api_usage_label"):
+                self.api_usage_label.configure(text_color=self.colors["muted"])
+            return
+
+        self.api_usage_busy = True
+        self.api_usage_text.set("Nexus API kota bilgisi alınıyor...")
+        if hasattr(self, "api_usage_refresh_button"):
+            self.api_usage_refresh_button.configure(state=tk.DISABLED)
+
+        def work() -> dict[str, object]:
+            try:
+                return {"rate_limit": fetch_official_api_usage(api_key)}
+            except Exception as exc:  # noqa: BLE001 - auxiliary GUI boundary.
+                return {"error": exc}
+
+        def done(payload: dict[str, object]) -> None:
+            if hasattr(self, "api_usage_refresh_button"):
+                self.api_usage_refresh_button.configure(state=tk.NORMAL)
+            if self._api_key() != api_key:
+                self.api_usage_text.set(
+                    "Resmî Nexus API kotası için API anahtarınızı kaydedin."
+                )
+                if hasattr(self, "api_usage_label"):
+                    self.api_usage_label.configure(text_color=self.colors["muted"])
+                return
+            rate_limit = payload.get("rate_limit")
+            if isinstance(rate_limit, NexusRateLimit):
+                self.api_usage_text.set(_format_nexus_api_usage(rate_limit))
+                if hasattr(self, "api_usage_label"):
+                    self.api_usage_label.configure(text_color=self.colors["success"])
+                self._log("Resmî Nexus API kota bilgisi güncellendi.")
+                return
+
+            self.api_usage_text.set("Nexus API kota bilgisi şu anda alınamadı.")
+            if hasattr(self, "api_usage_label"):
+                self.api_usage_label.configure(text_color=self.colors["warning"])
+            if not silent:
+                error = payload.get("error")
+                self._log(f"Nexus API kota bilgisi alınamadı: {error}")
+
+        self._run_auxiliary_task("api_usage_done", work, done)
 
     @staticmethod
     def _load_discord_support_icon() -> ctk.CTkImage | None:
@@ -1369,15 +2214,17 @@ class ModlistTranslationInstallerApp:
     def _open_output_folder(self) -> None:
         path = self._current_output_folder()
         if path is None:
-            messagebox.showinfo(
+            self._toast(
                 "Çıktı klasörü",
                 "Modlist klasörü seçilince çıktı konumu otomatik belirlenecek.",
+                tone="info",
             )
             return
         if not path.exists():
-            messagebox.showinfo(
-                "Çıktı klasörü henüz yok",
+            self._toast(
+                "Çıktı klasörü henüz oluşturulmadı",
                 f"Çeviri hazırlanınca bu klasör oluşacak:\n{path}",
+                tone="info",
             )
             return
         webbrowser.open(path.resolve().as_uri(), new=2, autoraise=True)
@@ -1387,12 +2234,181 @@ class ModlistTranslationInstallerApp:
         try:
             path.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            messagebox.showerror(
+            self._notify(
                 "Uygulama verileri açılamadı",
                 f"Uygulama veri klasörü oluşturulamadı:\n{path}\n\n{exc}",
+                tone="danger",
             )
             return
         webbrowser.open(path.resolve().as_uri(), new=2, autoraise=True)
+
+    def _show_download_cache_manager(self) -> None:
+        if self.busy:
+            self._toast(
+                "İşlem hâlâ devam ediyor",
+                "İndirme arşivleri devam eden işlem tamamlandıktan sonra temizlenebilir.",
+                tone="info",
+            )
+            return
+
+        current = inspect_download_cache(self.manifest, scope="current")
+        all_runs = inspect_download_cache(self.manifest, scope="all")
+        if self.download_cache_popup is not None and self.download_cache_popup.winfo_exists():
+            self.download_cache_popup.destroy()
+
+        popup = ctk.CTkToplevel(self.root)
+        self.download_cache_popup = popup
+        popup.title("İndirme arşivleri")
+        popup.geometry("640x390")
+        popup.minsize(590, 360)
+        popup.transient(self.root)
+        popup.configure(fg_color=self.colors["bg"])
+        popup.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            popup,
+            text="İndirme önbelleğini yönet",
+            text_color=self.colors["text"],
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+        ).grid(row=0, column=0, sticky="ew", padx=22, pady=(22, 6))
+        ctk.CTkLabel(
+            popup,
+            text=(
+                "Yalnızca indirilen ZIP, 7Z, RAR arşivleri ve yarım kalmış indirmeler "
+                "silinir. Manifestler, loglar ve hazırlanmış çeviri klasörleri korunur."
+            ),
+            text_color=self.colors["muted"],
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=590,
+        ).grid(row=1, column=0, sticky="ew", padx=22, pady=(0, 14))
+
+        self._build_download_cache_scope_card(
+            popup,
+            row=2,
+            title="Bu çeviri paketi",
+            detail="Yalnızca açık olan modlist ve paket sürümünün arşivlerini siler.",
+            summary=current,
+        )
+        self._build_download_cache_scope_card(
+            popup,
+            row=3,
+            title="Tüm çeviri paketleri",
+            detail="Bu bilgisayarda çeviri aracıyla indirilen bütün paket arşivlerini siler.",
+            summary=all_runs,
+        )
+        ctk.CTkButton(
+            popup,
+            text="Kapat",
+            command=popup.destroy,
+            corner_radius=8,
+            fg_color=self.colors["button"],
+            hover_color=self.colors["button_hover"],
+            width=110,
+        ).grid(row=4, column=0, sticky="e", padx=22, pady=(14, 20))
+        popup.lift()
+        popup.focus_force()
+
+    def _build_download_cache_scope_card(
+        self,
+        popup: ctk.CTkToplevel,
+        *,
+        row: int,
+        title: str,
+        detail: str,
+        summary: DownloadCacheSummary,
+    ) -> None:
+        card = ctk.CTkFrame(
+            popup,
+            fg_color=self.colors["panel"],
+            corner_radius=10,
+            border_width=1,
+            border_color=self.colors["line"],
+        )
+        card.grid(row=row, column=0, sticky="ew", padx=22, pady=5)
+        card.columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            card,
+            text=title,
+            text_color=self.colors["text"],
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(11, 1))
+        ctk.CTkLabel(
+            card,
+            text=(
+                f"{detail}\n{summary.file_count} arşiv, "
+                f"{format_cache_size(summary.total_bytes)}"
+            ),
+            text_color=self.colors["muted"],
+            anchor="w",
+            justify=tk.LEFT,
+        ).grid(row=1, column=0, sticky="w", padx=14, pady=(0, 11))
+        ctk.CTkButton(
+            card,
+            text="Temizle",
+            command=lambda: self._confirm_clear_download_cache(summary),
+            state=tk.NORMAL,
+            corner_radius=8,
+            fg_color=self.colors["button"],
+            hover_color=("#fee2e2", "#4c1d1d"),
+            text_color=self.colors["danger"],
+            width=104,
+        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=14, pady=12)
+
+    def _confirm_clear_download_cache(self, summary: DownloadCacheSummary) -> None:
+        scope_label = "bu çeviri paketinin" if summary.scope == "current" else "tüm paketlerin"
+        confirmed = self._confirm(
+            "İndirme arşivlerini temizle",
+            f"{scope_label.capitalize()} {summary.file_count} indirme arşivi "
+            f"({format_cache_size(summary.total_bytes)}) silinecek.\n\n"
+            "Hazırlanmış çeviri çıktıları silinmez. Bu dosyalar daha sonra yeniden "
+            "indirilmek zorunda kalabilir. Devam edilsin mi?",
+            action_label="Arşivleri temizle",
+            tone="warning",
+            parent=self.download_cache_popup or self.root,
+        )
+        if not confirmed:
+            return
+        if self.download_cache_popup is not None and self.download_cache_popup.winfo_exists():
+            self.download_cache_popup.destroy()
+        self.download_cache_popup = None
+
+        def work() -> DownloadCacheClearResult:
+            return clear_download_cache(self.manifest, scope=summary.scope)
+
+        def done(result: DownloadCacheClearResult) -> None:
+            self.use_manifest_download_cache_roots = False
+            self._reset_download_state()
+            self._set_progress(0, "İndirme planı yeniden hazırlanacak")
+            self._set_status("İndirme arşivleri temizlendi.", "success")
+            self._log(
+                f"İndirme arşivleri temizlendi: {result.deleted_files} dosya, "
+                f"{format_cache_size(result.deleted_bytes)}."
+            )
+            if result.failures:
+                self._log("Silinemeyen arşivler:")
+                for failure in result.failures:
+                    self._log(f"- {failure}")
+                self._notify(
+                    "Temizlik kısmen tamamlandı",
+                    f"{result.deleted_files} arşiv silindi. "
+                    f"{len(result.failures)} dosya silinemedi; ayrıntıları kontrol edin.",
+                    tone="warning",
+                    action_label="Detayları kontrol et",
+                )
+                return
+            self._toast(
+                "İndirme arşivleri temizlendi",
+                f"{result.deleted_files} arşiv silindi ve "
+                f"{format_cache_size(result.deleted_bytes)} alan boşaltıldı.\n\n"
+                "Bu oturumdaki sonraki işlem dosyaları yeniden indirecek.",
+                tone="success",
+                duration_ms=8500,
+            )
+
+        self._run_task("İndirme arşivleri temizleniyor", work, done)
 
     def _refresh_windows_long_paths_status(self) -> None:
         status = windows_long_path_status()
@@ -1417,11 +2433,13 @@ class ModlistTranslationInstallerApp:
         if windows_long_path_status().enabled:
             self._refresh_windows_long_paths_status()
             return
-        confirmed = messagebox.askyesno(
+        confirmed = self._confirm(
             "Windows uzun yol desteği",
             "Windows uzun yol desteği etkinleştirilsin mi?\n\n"
             "Bu işlem LongPathsEnabled kayıt değerini 1 yapar ve Windows yönetici onayı ister. "
             "Değişikliğin tüm uygulamalarda geçerli olması için bilgisayarı yeniden başlatmanız önerilir.",
+            action_label="Windows ayarını etkinleştir",
+            tone="warning",
         )
         if not confirmed:
             return
@@ -1434,10 +2452,12 @@ class ModlistTranslationInstallerApp:
                 return
             self._set_status("Windows uzun yol desteği etkin.", "success")
             self._log("Windows uzun yol desteği etkinleştirildi.")
-            messagebox.showinfo(
+            self._notify(
                 "Windows uzun yol desteği etkin",
                 "Uzun yol desteği etkinleştirildi.\n\n"
                 "Değişikliğin bütün uygulamalarda geçerli olması için bilgisayarı yeniden başlatmanız önerilir.",
+                tone="success",
+                action_label="Anladım",
             )
 
         self._run_task(
@@ -1510,12 +2530,16 @@ class ModlistTranslationInstallerApp:
 
     def _download_action_clicked(self) -> None:
         if not self._profile_check_completed():
-            messagebox.showwarning("Profil hazır değil", "Modlist klasörü ve profil kontrolü tamamlanmalı.")
+            self._toast(
+                "Önce profilinizi hazırlayın",
+                "Modlist klasörünü ve MO2 profilini seçin. Profil kontrolü tamamlandığında indirme açılacak.",
+                tone="warning",
+            )
             return
         if not self._ensure_profile_continue_confirmed():
             return
         if not self._api_key():
-            messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
+            self._show_api_required("Çevirileri indirmek")
             return
         if self.premium_plan_result is None:
             self._plan_downloads(auto_start=True)
@@ -1527,7 +2551,7 @@ class ModlistTranslationInstallerApp:
             return
         api_key = self._api_key()
         if not api_key:
-            messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
+            self._show_api_required("İndirme listesini hazırlamak")
             return
         out_dir = self._run_workspace() / "runtime"
         download_dir = self._run_workspace() / "downloads"
@@ -1544,6 +2568,7 @@ class ModlistTranslationInstallerApp:
                 delivery_mode=self._delivery_mode_value(),
                 api_key=api_key,
                 allow_profile_drift=self.profile_override_accepted,
+                use_manifest_download_cache_roots=self.use_manifest_download_cache_roots,
             )
 
         def done(result: Any) -> None:
@@ -1578,27 +2603,68 @@ class ModlistTranslationInstallerApp:
             return
         api_key = self._api_key()
         if not api_key:
-            messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
+            self._show_api_required("Çeviri dosyalarını indirmek")
             return
         if self._delivery_mode_value() == "NON_PREMIUM_NXM":
             self._open_next_non_premium_page()
             return
         queue_path = self._current_download_queue_path()
+        queue_payload = json.loads(queue_path.read_text(encoding="utf-8"))
+        readiness = download_queue_readiness(self.manifest, queue_payload)
+        download_lookup = _download_item_lookup(queue_payload)
 
         def work() -> Any:
             self._ensure_premium_api_key(api_key)
-            download_total = self._eta_total
+            download_total = int(readiness.get("missing_count") or 0)
+            attempts: dict[tuple[str, str], int] = {}
+            completed: set[tuple[str, str]] = set()
 
             def tracked_downloader(url: str, part_path: Path) -> int:
-                bytes_written = urllib_download_to_file(url, part_path)
+                item = _download_item_for_part_path(part_path, download_lookup)
+                identity = (
+                    str(item.get("translation_nexus_mod_id") or "?"),
+                    str(item.get("translation_file_id") or "?"),
+                )
+                attempts[identity] = attempts.get(identity, 0) + 1
                 self.task_queue.put(
                     (
-                        "eta",
+                        "download_progress",
                         {
-                            "phase": "premium_download",
-                            "completed_delta": 1,
+                            **item,
+                            "stage": "started",
+                            "attempt": attempts[identity],
+                            "completed": len(completed),
                             "total": download_total,
-                            "label": "Dosya indiriliyor",
+                        },
+                    )
+                )
+                try:
+                    bytes_written = urllib_download_to_file(url, part_path)
+                except Exception as exc:
+                    self.task_queue.put(
+                        (
+                            "download_progress",
+                            {
+                                **item,
+                                "stage": "retry",
+                                "attempt": attempts[identity],
+                                "completed": len(completed),
+                                "total": download_total,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+                    )
+                    raise
+                completed.add(identity)
+                self.task_queue.put(
+                    (
+                        "download_progress",
+                        {
+                            **item,
+                            "stage": "completed",
+                            "attempt": attempts[identity],
+                            "completed": len(completed),
+                            "total": download_total,
                         },
                     )
                 )
@@ -1609,6 +2675,7 @@ class ModlistTranslationInstallerApp:
                 api_key=api_key,
                 queue_path=queue_path,
                 file_downloader=tracked_downloader,
+                max_attempts=2,
             )
 
         def done(result: Any) -> None:
@@ -1617,6 +2684,7 @@ class ModlistTranslationInstallerApp:
             readiness = download_queue_readiness(self.manifest, result.download_run.updated_queue_payload)
             run_summary = result.download_run.manifest_payload.get("summary", {})
             if readiness["complete"]:
+                self.current_download_text.set("Tüm gerekli çeviri dosyaları hazır.")
                 self.download_status_text.set(
                     f"Tamamlandi: {run_summary.get('downloaded', 0)} indirildi, "
                     f"{run_summary.get('already_present', 0)} zaten vardi."
@@ -1624,6 +2692,17 @@ class ModlistTranslationInstallerApp:
                 self._set_status("Tüm dosyalar hazır.", "success")
                 self._set_progress(75, "Çeviri hazırlanabilir")
             else:
+                unavailable = unavailable_non_premium_downloads(
+                    result.download_run.updated_queue_payload
+                )
+                premium_missing_count = int(readiness.get("missing_count") or 0)
+                self.current_download_text.set(
+                    f"İndirme tamamlandı; {len(unavailable)} dosya kullanıcı işlemi bekliyor."
+                )
+                if self._delivery_mode_value() != "NON_PREMIUM_NXM":
+                    self.current_download_text.set(
+                        f"İndirme tamamlandı; {premium_missing_count} dosya hâlâ eksik."
+                    )
                 self.download_status_text.set(
                     f"{readiness['missing_count']} dosya eksik, "
                     f"{run_summary.get('failed', 0)} hata."
@@ -1632,10 +2711,14 @@ class ModlistTranslationInstallerApp:
                 self._set_progress(55, "İndirme devam etmeli")
             self._log(f"İndirme sonucu: {result.download_run.manifest_path}")
             self._refresh_pipeline_buttons()
+            self._refresh_api_usage(silent=True)
+            if not readiness["complete"]:
+                self._show_download_recovery_popup(result.download_run.updated_queue_payload)
 
         self._set_progress(55, "Dosya indiriliyor")
-        queue_payload = json.loads(queue_path.read_text(encoding="utf-8"))
-        readiness = download_queue_readiness(self.manifest, queue_payload)
+        self.current_download_text.set(
+            f"İndirme başlatılıyor: {readiness['missing_count']} dosya bekliyor."
+        )
         self._start_time_estimate(
             phase="premium_download",
             total=int(readiness.get("missing_count") or 0),
@@ -1655,7 +2738,7 @@ class ModlistTranslationInstallerApp:
             self._plan_downloads(auto_start=True)
             return
         if not self._api_key():
-            messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
+            self._show_api_required("Ücretsiz tarayıcı indirmesini başlatmak")
             return
         queue_payload = json.loads(self._current_download_queue_path().read_text(encoding="utf-8"))
         item = next_non_premium_download(queue_payload)
@@ -1671,6 +2754,22 @@ class ModlistTranslationInstallerApp:
             return
         if not self._ensure_nxm_capture_active():
             return
+        unavailable = unavailable_non_premium_downloads(queue_payload)
+        position = next(
+            (
+                index
+                for index, candidate in enumerate(unavailable, start=1)
+                if candidate.get("translation_nexus_mod_id")
+                == item.get("translation_nexus_mod_id")
+                and candidate.get("translation_file_id") == item.get("translation_file_id")
+            ),
+            1,
+        )
+        label = item["translation_file_name"] or item["translation_name"] or "Nexus dosyası"
+        self.current_download_text.set(
+            f"{position}/{len(unavailable) or 1} · {label}\n"
+            f"Nexus sayfası açık; Slow Download düğmesine tıklamanız bekleniyor."
+        )
         webbrowser.open(item["page_url"], new=2, autoraise=True)
         self._set_status("Nexus sayfası açıldı, Slow Download'a tıklayın.")
         self.nxm_status_text.set(
@@ -1688,24 +2787,33 @@ class ModlistTranslationInstallerApp:
         try:
             value = self.root.clipboard_get()
         except tk.TclError:
-            messagebox.showwarning("Pano boş", "Panoda okunabilir indirme bağlantısı bulunamadı.")
+            self._toast(
+                "Panoda indirme bağlantısı yok",
+                "Önce Nexus Slow Download bağlantısını kopyalayın, ardından yeniden deneyin.",
+                tone="warning",
+            )
             return
         self.nxm_link.set(value)
         self._submit_nxm_link()
 
     def _submit_nxm_link(self) -> None:
         if self.premium_plan_result is None:
-            messagebox.showwarning("İndirme hazır değil", "Önce indirme hazırlığı yapılmalı.")
+            self._toast(
+                "İndirme henüz hazırlanmadı",
+                "Önce Çevirileri indir düğmesiyle indirme listesini hazırlayın.",
+                tone="warning",
+            )
             return
         api_key = self._api_key()
         if not api_key:
-            messagebox.showwarning("API gerekli", "Nexus API anahtarı kaydedilmeli.")
+            self._show_api_required("İndirme bağlantısını kullanmak")
             return
         nxm_url = self.nxm_link.get().strip()
         if not nxm_url:
-            messagebox.showwarning(
+            self._toast(
                 "İndirme bağlantısı gerekli",
                 "Slow Download ile oluşan indirme bağlantısı gerekli.",
+                tone="warning",
             )
             return
         queue_path = self._current_download_queue_path()
@@ -1725,12 +2833,20 @@ class ModlistTranslationInstallerApp:
             self.nxm_link.set("")
             readiness = download_queue_readiness(self.manifest, result.updated_queue_payload)
             if result.result_payload.get("status") == "DOWNLOADED":
+                authorization = result.result_payload.get("authorization", {})
+                self.current_download_text.set(
+                    "Dosya indirildi: "
+                    f"Nexus {authorization.get('mod_id', '?')}/{authorization.get('file_id', '?')}"
+                )
                 self.download_status_text.set(
                     f"Dosya indirildi. Kalan: {readiness['missing_count']} / "
                     f"{readiness['required_count']}."
                 )
             else:
                 failed_label = self._first_non_premium_failure_label(result.updated_queue_payload)
+                self.current_download_text.set(
+                    f"Dosya indirilemedi: {failed_label or 'ayrıntılar kaydedildi'}."
+                )
                 failure_hint = self._first_non_premium_failure_hint(result.updated_queue_payload)
                 self.download_status_text.set(
                     f"Dosya indirilemedi: {failed_label or 'hata ayrıntısı detaylarda'}."
@@ -1769,9 +2885,11 @@ class ModlistTranslationInstallerApp:
             status = self.nxm_protocol_binding.bind()
         except Exception as exc:  # noqa: BLE001 - GUI boundary reports safe setup failure.
             server.stop()
-            messagebox.showerror(
-                "Tarayıcı indirme yakalama başlatılamadı",
+            self._notify(
+                "Tarayıcı bağlantısı yakalanamadı",
                 f"İndirme bağlantısı Çeviri aracı'na yönlendirilemedi: {exc}",
+                tone="danger",
+                action_label="Detayları kontrol et",
             )
             return False
         self.nxm_capture_server = server
@@ -1803,6 +2921,9 @@ class ModlistTranslationInstallerApp:
             return
         self.nxm_link.set(nxm_url)
         self.nxm_status_text.set("Slow Download yakalandı; dosya indiriliyor.")
+        self.current_download_text.set(
+            f"{self.current_download_text.get()}\nİndirme bağlantısı yakalandı; dosya alınıyor."
+        )
         self._submit_nxm_link()
 
     def _process_pending_nxm(self) -> None:
@@ -1813,8 +2934,24 @@ class ModlistTranslationInstallerApp:
         self._handle_captured_nxm(nxm_url)
 
     def _prepare_translation(self) -> None:
+        retry_seconds = self._conversion_retry_seconds()
+        if retry_seconds > 0:
+            self._toast(
+                "Kısa bir süre bekleyin",
+                (
+                    "Arka plan işlemlerinin kapanması için "
+                    f"{retry_seconds} saniye daha bekleyin. Sayaç bittiğinde "
+                    "Çeviriyi hazırla düğmesini yeniden kullanabilirsiniz."
+                ),
+                tone="warning",
+            )
+            return
         if not self.profile_scan_path or self.premium_plan_result is None:
-            messagebox.showwarning("Hazırlık gerekli", "Önce çevirileri indirin.")
+            self._toast(
+                "Önce çevirileri indirin",
+                "Çeviri paketi hazırlanmadan önce gerekli Nexus dosyalarının indirilmesi gerekiyor.",
+                tone="warning",
+            )
             return
         if not self._ensure_profile_continue_confirmed():
             return
@@ -1822,16 +2959,21 @@ class ModlistTranslationInstallerApp:
         queue_payload = json.loads(queue_path.read_text(encoding="utf-8"))
         readiness = download_queue_readiness(self.manifest, queue_payload)
         if not readiness["complete"]:
-            messagebox.showwarning(
+            self._toast(
                 "Dosyalar eksik",
                 f"{readiness['missing_count']} gerekli dosya henüz hazır değil.",
+                tone="warning",
             )
             return
         run_workspace = self._run_workspace()
         manifest_path = self._write_runtime_manifest()
         selected_mods_root = self._selected_mods_root()
         if selected_mods_root is None:
-            messagebox.showwarning("Modlist klasörü gerekli", "Önce modlist klasörünü seçin.")
+            self._toast(
+                "Modlist klasörü gerekli",
+                "Çeviri çıktısının nereye kurulacağını belirlemek için önce modlist klasörünü seçin.",
+                tone="warning",
+            )
             return
 
         def work() -> Any:
@@ -1879,6 +3021,9 @@ class ModlistTranslationInstallerApp:
                 )
                 self._set_status("Çeviri paketi başarıyla hazırlandı.", "success", prominent=True)
                 self._set_progress(100, "Kurulum tamamlandı")
+                self.current_download_text.set(
+                    f"Çeviri paketi hazırlandı.\nÇıktı: {result.conversion.output_mod_path}"
+                )
                 self._show_completion_popup(Path(result.conversion.output_mod_path))
             self._log(f"Çıktı klasörü: {result.conversion.output_mod_path}")
             self._log(f"Rapor: {result.conversion.report_path}")
@@ -1897,98 +3042,112 @@ class ModlistTranslationInstallerApp:
 
         popup = ctk.CTkToplevel(self.root)
         self.completion_popup = popup
-        popup.title("Çeviri paketi hazır")
+        popup.title("Çeviri hazır")
         popup.resizable(False, False)
         popup.transient(self.root)
         popup.configure(fg_color=self.colors["bg"])
+        popup.columnconfigure(0, weight=1)
 
         def close_popup() -> None:
             try:
                 popup.grab_release()
             except tk.TclError:
                 pass
+            self.completion_endorsement_button = None
             self.completion_popup = None
             popup.destroy()
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
 
-        card = ctk.CTkFrame(
+        ctk.CTkLabel(
             popup,
-            fg_color=self.colors["panel"],
-            corner_radius=16,
-            border_width=1,
-            border_color=self.colors["line"],
-        )
-        card.pack(fill=tk.BOTH, expand=True, padx=22, pady=22)
-
-        ctk.CTkLabel(
-            card,
-            text="Çeviri Paketi Başarıyla Kuruldu",
+            text="KURULUM TAMAMLANDI",
             text_color=self.colors["success"],
-            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
-        ).pack(anchor="w", padx=24, pady=(22, 10))
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
+        ).grid(row=0, column=0, sticky="ew", padx=28, pady=(24, 3))
         ctk.CTkLabel(
-            card,
-            text="Çeviri paketi başarıyla bu hedefe kuruldu:",
+            popup,
+            text="Çeviri paketi hazır",
             text_color=self.colors["text"],
-            font=ctk.CTkFont(family="Segoe UI", size=15),
-        ).pack(anchor="w", padx=24)
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"),
+        ).grid(row=1, column=0, sticky="ew", padx=28)
         ctk.CTkLabel(
-            card,
+            popup,
+            text="Paket seçtiğiniz modlistin MO2 mods klasörüne oluşturuldu.",
+            text_color=self.colors["muted"],
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=14),
+        ).grid(row=2, column=0, sticky="ew", padx=28, pady=(5, 16))
+        ctk.CTkLabel(
+            popup,
             text=str(output_folder),
             text_color=self.colors["text"],
             fg_color=self.colors["panel_alt"],
-            corner_radius=10,
+            corner_radius=8,
             justify=tk.LEFT,
             anchor="w",
-            wraplength=620,
-            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
-        ).pack(fill=tk.X, padx=24, pady=(10, 18), ipady=10)
+            wraplength=630,
+            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+        ).grid(row=3, column=0, sticky="ew", padx=28, ipady=9)
         ctk.CTkLabel(
-            card,
-            text="MO2'de çeviriyi aktif etmeyi unutmayın.",
+            popup,
+            text="MO2 içinde çeviri modunu aktif etmeyi unutmayın.",
             text_color=self.colors["warning"],
-            font=ctk.CTkFont(family="Segoe UI", size=17, weight="bold"),
-        ).pack(anchor="w", padx=24, pady=(0, 22))
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=15, weight="bold"),
+        ).grid(row=4, column=0, sticky="ew", padx=28, pady=(14, 0))
 
         completion_notice = self.branding.completion_notice
+        next_row = 5
         if completion_notice is not None:
-            notice_frame = ctk.CTkFrame(
-                card,
-                fg_color=self.colors["panel_alt"],
-                corner_radius=10,
-                border_width=1,
-                border_color=self.colors["line"],
-            )
-            notice_frame.pack(fill=tk.X, padx=24, pady=(0, 18))
+            ctk.CTkFrame(
+                popup,
+                height=1,
+                fg_color=self.colors["line"],
+            ).grid(row=5, column=0, sticky="ew", padx=28, pady=(18, 12))
             ctk.CTkLabel(
-                notice_frame,
+                popup,
                 text=completion_notice.text,
-                text_color=self.colors["text"],
+                text_color=self.colors["warning"],
                 justify=tk.LEFT,
                 anchor="w",
-                wraplength=610,
-                font=ctk.CTkFont(family="Segoe UI", size=14),
-            ).pack(fill=tk.X, padx=14, pady=(12, 8 if completion_notice.url else 12))
+                wraplength=620,
+                font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            ).grid(row=6, column=0, sticky="ew", padx=28)
+            next_row = 7
             if completion_notice.url:
                 ctk.CTkButton(
-                    notice_frame,
+                    popup,
                     text=completion_notice.action_label or "Mod sayfasını aç",
                     command=lambda url=completion_notice.url: webbrowser.open(
                         url,
                         new=2,
                         autoraise=True,
                     ),
-                    corner_radius=9,
-                    fg_color=self.colors["button"],
-                    hover_color=self.colors["button_hover"],
-                    height=36,
-                ).pack(anchor="w", padx=14, pady=(0, 12))
+                    corner_radius=7,
+                    fg_color="transparent",
+                    hover_color=self.colors["panel_alt"],
+                    border_width=1,
+                    border_color=self.colors["line"],
+                    text_color=self.colors["text"],
+                    height=34,
+                    width=170,
+                ).grid(row=7, column=0, sticky="w", padx=28, pady=(9, 0))
+                next_row = 8
 
-        buttons = ctk.CTkFrame(card, fg_color="transparent")
-        buttons.pack(fill=tk.X, padx=24, pady=(0, 22))
-        buttons.columnconfigure(0, weight=1)
-        buttons.columnconfigure(1, weight=1)
+        ctk.CTkFrame(
+            popup,
+            height=1,
+            fg_color=self.colors["line"],
+        ).grid(row=next_row, column=0, sticky="ew", padx=28, pady=(18, 14))
+
+        buttons = ctk.CTkFrame(popup, fg_color="transparent")
+        buttons.grid(row=next_row + 1, column=0, sticky="ew", padx=28, pady=(0, 24))
+        action_count = 3 if self.endorsement_available else 2
+        for column in range(action_count):
+            buttons.columnconfigure(column, weight=1)
         ctk.CTkButton(
             buttons,
             text="Klasörü aç",
@@ -1997,20 +3156,43 @@ class ModlistTranslationInstallerApp:
             fg_color=self.colors["button"],
             hover_color=self.colors["button_hover"],
             height=40,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        close_column = 1
+        if self.endorsement_available:
+            self.completion_endorsement_button = ctk.CTkButton(
+                buttons,
+                text=ENDORSE_BUTTON_LABEL,
+                command=lambda: self._endorse_release(parent=popup),
+                corner_radius=10,
+                fg_color=self.colors["premium"],
+                hover_color="#ffad4d",
+                text_color=("#ffffff", "#ffffff"),
+                height=40,
+                font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
+            )
+            self.completion_endorsement_button.grid(
+                row=0,
+                column=1,
+                sticky="ew",
+                padx=6,
+            )
+            close_column = 2
+            self._sync_endorsement_buttons()
+
         ctk.CTkButton(
             buttons,
-            text="Tamam",
+            text="Kapat",
             command=close_popup,
             corner_radius=10,
             fg_color=self.colors["accent"],
             hover_color=self.colors["accent_hover"],
             height=40,
-        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ).grid(row=0, column=close_column, sticky="ew", padx=(6, 0))
 
         popup.update_idletasks()
         width = max(700, popup.winfo_reqwidth())
-        height = max(320, popup.winfo_reqheight())
+        height = max(300, popup.winfo_reqheight())
         root_x = self.root.winfo_rootx()
         root_y = self.root.winfo_rooty()
         root_width = max(self.root.winfo_width(), 1)
@@ -2099,22 +3281,24 @@ class ModlistTranslationInstallerApp:
 
     def _ensure_profile_continue_confirmed(self) -> bool:
         if not self.preflight_payload:
-            messagebox.showwarning(
-                "Profil hazır değil",
-                "Modlist klasörü ve profil kontrolü tamamlanmalı.",
+            self._toast(
+                "Profil henüz hazır değil",
+                "Modlist klasörünü ve MO2 profilini seçin. Kontrol tamamlandığında devam edebilirsiniz.",
+                tone="warning",
             )
             return False
         if self._preflight_ready():
             return True
         if not self._profile_check_completed():
-            messagebox.showwarning(
-                "Profil hazır değil",
+            self._toast(
+                "Profil kontrolü tamamlanmadı",
                 "Profil kontrolü tamamlanmadan indirme başlatılamaz.",
+                tone="warning",
             )
             return False
 
         summary = preflight_summary(self.preflight_payload)
-        accepted = messagebox.askyesno(
+        accepted = self._confirm(
             "Profil birebir eşleşmiyor",
             "Seçili profil stok paketle birebir uyuşmuyor.\n\n"
             f"Eşleşen çeviri: {summary['matched_entries']}/{summary['manifest_entries']}\n"
@@ -2123,6 +3307,9 @@ class ModlistTranslationInstallerApp:
             "Bu durumda çeviri yine kurulabilir, ancak mod listenizde yaptığınız "
             "ekleme veya değişikliklerden kaynaklı bazı çeviriler uygulanmayabilir.\n\n"
             "Yine de devam etmek istiyor musunuz?",
+            action_label="Yine de devam et",
+            cancel_label="Profile geri dön",
+            tone="warning",
         )
         if not accepted:
             self.download_status_text.set("Profil farkı onaylanmadan indirme başlatılamaz.")
@@ -2159,6 +3346,19 @@ class ModlistTranslationInstallerApp:
             text=state.prepare_label,
             state=tk.NORMAL if state.can_prepare else tk.DISABLED,
         )
+        retry_seconds = self._conversion_retry_seconds()
+        if retry_seconds > 0:
+            self.prepare_button.configure(
+                text=f"Yeniden deneme: {retry_seconds} sn",
+                state=tk.DISABLED,
+            )
+            self.prepare_status_text.set(
+                "Arka plan işlemleri kapanıyor. Sayaç bitince yeniden deneyebilirsiniz."
+            )
+        if hasattr(self, "download_cache_button"):
+            self.download_cache_button.configure(
+                state=tk.DISABLED if self.busy else tk.NORMAL
+            )
         if hasattr(self, "manifest_mode_control"):
             self.manifest_mode_control.configure(
                 state=tk.DISABLED if self.busy else tk.NORMAL
@@ -2200,6 +3400,7 @@ class ModlistTranslationInstallerApp:
 
     def _reset_download_state(self) -> None:
         self._stop_nxm_capture()
+        self._stop_conversion_retry_cooldown()
         self.premium_plan_result = None
         self.premium_download_result = None
         self.non_premium_download_result = None
@@ -2209,11 +3410,20 @@ class ModlistTranslationInstallerApp:
         self.nxm_link.set("")
         self.output_folder_text.set(self._output_folder_display())
         self.download_status_text.set("Profil hazırlanınca indirme açılır.")
+        self.current_download_text.set(
+            "İndirme veya hazırlama başlayınca işlem bilgisi burada görünür."
+        )
         self.prepare_status_text.set("Tüm gerekli dosyalar hazır olmadan başlatılamaz.")
         self._reset_prepare_status_style()
         if self.completion_popup is not None and self.completion_popup.winfo_exists():
             self.completion_popup.destroy()
             self.completion_popup = None
+        if (
+            self.download_recovery_popup is not None
+            and self.download_recovery_popup.winfo_exists()
+        ):
+            self.download_recovery_popup.destroy()
+            self.download_recovery_popup = None
         self._refresh_non_premium_prompt()
         self._refresh_pipeline_buttons()
 
@@ -2275,7 +3485,11 @@ class ModlistTranslationInstallerApp:
         failed = failed_non_premium_downloads(queue_payload)
         if not failed:
             if dialog:
-                messagebox.showinfo("Dosya yok", "Açılacak yeni Nexus dosyası bulunamadı.")
+                self._toast(
+                    "Bekleyen dosya bulunamadı",
+                    "Açılacak yeni bir Nexus indirme sayfası yok.",
+                    tone="info",
+                )
             return
         self._log("Başarısız tarayıcı indirmeleri:")
         lines = []
@@ -2289,7 +3503,124 @@ class ModlistTranslationInstallerApp:
             self._log(f"- ... {len(failed) - 10} ek başarısız dosya")
             lines.append(f"- ... {len(failed) - 10} ek başarısız dosya")
         if dialog:
-            messagebox.showwarning("İndirilemeyen dosyalar", "\n\n".join(lines))
+            self._notify(
+                "İndirilemeyen dosyalar",
+                "\n\n".join(lines),
+                tone="warning",
+                action_label="Detayları kapat",
+            )
+
+    def _show_download_recovery_popup(self, queue_payload: dict[str, Any]) -> None:
+        unavailable = unavailable_non_premium_downloads(queue_payload)
+        if not unavailable:
+            return
+        existing = getattr(self, "download_recovery_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.destroy()
+
+        popup = ctk.CTkToplevel(self.root)
+        self.download_recovery_popup = popup
+        popup.title("Eksik indirmeleri tamamla")
+        popup.geometry("760x520")
+        popup.minsize(680, 430)
+        popup.transient(self.root)
+        popup.configure(fg_color=self.colors["bg"])
+
+        def close_popup() -> None:
+            try:
+                popup.grab_release()
+            except tk.TclError:
+                pass
+            self.download_recovery_popup = None
+            popup.destroy()
+
+        def start_browser_recovery() -> None:
+            close_popup()
+            self.delivery_mode.set(NON_PREMIUM_DELIVERY_LABEL)
+            self._refresh_auth_status()
+            self._refresh_non_premium_prompt()
+            self._refresh_pipeline_buttons()
+            self._log(
+                f"Tarayıcıyla manuel tamamlama başlatıldı: {len(unavailable)} dosya bekliyor."
+            )
+            self._open_next_non_premium_page()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        card = ctk.CTkFrame(
+            popup,
+            fg_color=self.colors["panel"],
+            corner_radius=14,
+            border_width=1,
+            border_color=self.colors["line"],
+        )
+        card.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        ctk.CTkLabel(
+            card,
+            text=f"{len(unavailable)} dosya otomatik indirilemedi",
+            text_color=self.colors["warning"],
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=21, weight="bold"),
+        ).pack(fill=tk.X, padx=20, pady=(18, 6))
+        ctk.CTkLabel(
+            card,
+            text=(
+                "İşleme tarayıcı üzerinden devam edebilirsiniz. Çeviri aracı sıradaki "
+                "Nexus sayfasını açar ve Slow Download bağlantısını otomatik yakalar."
+            ),
+            text_color=self.colors["text"],
+            justify=tk.LEFT,
+            anchor="w",
+            wraplength=680,
+            font=ctk.CTkFont(family="Segoe UI", size=13),
+        ).pack(fill=tk.X, padx=20, pady=(0, 12))
+        details = ctk.CTkTextbox(
+            card,
+            fg_color=self.colors["panel_alt"],
+            text_color=self.colors["text"],
+            border_width=1,
+            border_color=self.colors["line"],
+            corner_radius=9,
+            height=250,
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            wrap=tk.WORD,
+        )
+        details.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 14))
+        for position, item in enumerate(unavailable, start=1):
+            error = str(item.get("last_error") or "otomatik indirme tamamlanamadı")
+            details.insert(
+                tk.END,
+                f"{position}. {self._format_non_premium_item(item)}\n"
+                f"   {error}\n   {item.get('page_url') or ''}\n\n",
+            )
+        details.configure(state=tk.DISABLED)
+        buttons = ctk.CTkFrame(card, fg_color="transparent")
+        buttons.pack(fill=tk.X, padx=20, pady=(0, 18))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+        ctk.CTkButton(
+            buttons,
+            text="Daha sonra",
+            command=close_popup,
+            fg_color=self.colors["button"],
+            hover_color=self.colors["button_hover"],
+            corner_radius=9,
+            height=40,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 7))
+        ctk.CTkButton(
+            buttons,
+            text="Tarayıcıyla tamamla",
+            command=start_browser_recovery,
+            fg_color=self.colors["accent"],
+            hover_color=self.colors["accent_hover"],
+            corner_radius=9,
+            height=40,
+        ).grid(row=0, column=1, sticky="ew", padx=(7, 0))
+        popup.lift()
+        popup.focus_force()
+        try:
+            popup.grab_set()
+        except tk.TclError:
+            pass
 
     def _format_non_premium_item(self, item: dict[str, Any]) -> str:
         label = (
@@ -2391,6 +3722,8 @@ class ModlistTranslationInstallerApp:
             progress_span=10,
         )
         self._eta_status_path = status_path
+        self._last_conversion_archive_key = None
+        self.current_download_text.set("Çeviri arşivleri hazırlanıyor...")
         self.eta_text.set(format_eta(None))
         self._eta_after = self.root.after(700, self._poll_conversion_time_estimate)
 
@@ -2422,6 +3755,93 @@ class ModlistTranslationInstallerApp:
             label=label,
         )
 
+    def _handle_download_progress_event(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        stage = str(payload.get("stage") or "")
+        position = max(1, int(payload.get("position") or 1))
+        total = max(1, int(payload.get("total") or self._eta_total or 1))
+        completed = max(0, int(payload.get("completed") or 0))
+        attempt = max(1, int(payload.get("attempt") or 1))
+        translation_name = str(payload.get("translation_name") or "").strip()
+        file_name = str(payload.get("translation_file_name") or "").strip()
+        mod_id = payload.get("translation_nexus_mod_id") or "?"
+        file_id = payload.get("translation_file_id") or "?"
+        display_name = translation_name or file_name or "Nexus çeviri dosyası"
+        file_detail = f"\nDosya: {file_name}" if file_name and file_name != display_name else ""
+
+        if stage == "started":
+            retry_text = f" · {attempt}. deneme" if attempt > 1 else ""
+            self.current_download_text.set(
+                f"{position}/{total} · {display_name}{retry_text}{file_detail}\n"
+                f"Nexus: {mod_id}/{file_id}"
+            )
+            self.download_status_text.set(f"İndiriliyor: {position}/{total} · {display_name}")
+            self._update_time_estimate(
+                completed=completed,
+                total=total,
+                label=f"Dosya indiriliyor: {position}/{total}",
+            )
+            self._log(
+                f"İndiriliyor [{position}/{total}]: {display_name} "
+                f"({mod_id}/{file_id}), deneme {attempt}."
+            )
+            return
+
+        if stage == "retry":
+            self.current_download_text.set(
+                f"{position}/{total} · {display_name}\n"
+                f"Bağlantı tamamlanamadı; güvenli yeniden deneme hazırlanıyor."
+            )
+            self.download_status_text.set(
+                f"Yeniden denenecek: {display_name} ({attempt}. deneme tamamlanamadı)"
+            )
+            self._log(
+                f"İndirme yeniden denenecek [{position}/{total}]: {display_name}; "
+                f"{payload.get('error_type') or 'bağlantı hatası'}."
+            )
+            return
+
+        if stage == "completed":
+            self.current_download_text.set(
+                f"İndirildi: {display_name}{file_detail}\nNexus: {mod_id}/{file_id}"
+            )
+            self.download_status_text.set(f"İndirildi: {completed}/{total} · {display_name}")
+            self._update_time_estimate(
+                completed=completed,
+                total=total,
+                label=f"Dosya indirildi: {completed}/{total}",
+            )
+
+    def _handle_endorsement_progress_event(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        target = payload.get("target")
+        if not isinstance(target, ReleaseEndorsementTarget):
+            return
+        done = max(1, int(payload.get("done") or 1))
+        total = max(1, int(payload.get("total") or 1))
+        status = str(payload.get("status") or "")
+        status_labels = {
+            "endorsed": "beğenildi",
+            "already_endorsed": "zaten beğenilmiş",
+            "wait_required": "15 dakika bekliyor",
+            "disabled": "endorse kapalı",
+            "own_file": "kendi dosyası",
+            "abstained": "abstain seçili",
+            "rate_limited": "kota bekliyor",
+            "unauthorized": "API yetkisi yok",
+            "transient_error": "bağlantı bekliyor",
+            "failed": "tamamlanamadı",
+        }
+        label = status_labels.get(status, "işleniyor")
+        self.endorsement_status_text.set(
+            f"Beğeni: {done}/{total} - {target.label} - {label}"
+        )
+        self._log(
+            f"Endorse [{done}/{total}]: {target.label} ({target.mod_id}) - {label}."
+        )
+
     def _poll_conversion_time_estimate(self) -> None:
         if self._eta_phase != "conversion" or self._eta_status_path is None or not self.busy:
             self._eta_after = None
@@ -2436,7 +3856,31 @@ class ModlistTranslationInstallerApp:
         alias_processed = int(payload.get("processed_alias_plugins") or 0)
         total = int(payload.get("total_archives") or 0)
         processed = int(payload.get("processed_archives") or 0)
-        if alias_total > 0:
+        archive_information = _conversion_archive_information(payload)
+        if archive_information is not None:
+            archive_key, archive_text = archive_information
+            if archive_key != self._last_conversion_archive_key:
+                self._last_conversion_archive_key = archive_key
+                self.current_download_text.set(archive_text)
+                self._log(archive_text.replace("\n", " · "))
+
+        if runtime_stage == "extracting_add_on_package":
+            position = max(1, int(payload.get("processed_packages") or 1))
+            package_total = max(1, int(payload.get("total_packages") or 1))
+            self.eta_text.set("Ek paket uygulanıyor")
+            self._set_progress(
+                max(int(self.progress_value.get()), 98),
+                f"Ek paket çıkarılıyor: {position}/{package_total}",
+            )
+        elif runtime_stage == "extracting_native_binary_asset":
+            position = max(1, int(payload.get("processed_assets") or 1))
+            asset_total = max(1, int(payload.get("total_assets") or 1))
+            self.eta_text.set("Ek dosya uygulanıyor")
+            self._set_progress(
+                max(int(self.progress_value.get()), 98),
+                f"Ek dosya çıkarılıyor: {position}/{asset_total}",
+            )
+        elif alias_total > 0:
             display_processed = max(1, min(alias_processed, alias_total))
             self.eta_text.set("Profil eklentileri kontrol ediliyor")
             self._set_progress(
@@ -2541,6 +3985,50 @@ class ModlistTranslationInstallerApp:
                 pass
         self._busy_progress_after = None
 
+    def _conversion_retry_seconds(self) -> int:
+        return _conversion_retry_seconds_remaining(
+            ready_at=self._conversion_retry_ready_at,
+            now=time.monotonic(),
+        )
+
+    def _start_conversion_retry_cooldown(self) -> None:
+        self._stop_conversion_retry_cooldown()
+        self._conversion_retry_ready_at = (
+            time.monotonic() + CONVERSION_RETRY_COOLDOWN_SECONDS
+        )
+        self._update_conversion_retry_cooldown()
+
+    def _update_conversion_retry_cooldown(self) -> None:
+        self._conversion_retry_after = None
+        remaining = self._conversion_retry_seconds()
+        if remaining <= 0:
+            self._conversion_retry_ready_at = 0.0
+            self._refresh_pipeline_buttons()
+            self.prepare_status_text.set(
+                "Bekleme tamamlandı. Çeviriyi hazırla düğmesine yeniden basabilirsiniz."
+            )
+            self._set_status("Yeniden denemeye hazır.", "warning", prominent=True)
+            return
+        self._refresh_pipeline_buttons()
+        self._set_status(
+            f"Yeniden denemeden önce {remaining} saniye bekleyin.",
+            "warning",
+            prominent=True,
+        )
+        self._conversion_retry_after = self.root.after(
+            1000,
+            self._update_conversion_retry_cooldown,
+        )
+
+    def _stop_conversion_retry_cooldown(self) -> None:
+        if self._conversion_retry_after is not None:
+            try:
+                self.root.after_cancel(self._conversion_retry_after)
+            except tk.TclError:
+                pass
+        self._conversion_retry_after = None
+        self._conversion_retry_ready_at = 0.0
+
     def _write_gui_error_log(self, error: BaseException, traceback_text: str) -> Path | None:
         local_app_data = os.environ.get("LOCALAPPDATA")
         log_root = (
@@ -2574,8 +4062,41 @@ class ModlistTranslationInstallerApp:
             self.progress_label.set("Premium indirme başlatılmadı")
             self.download_status_text.set(str(error).splitlines()[0])
             self._log(f"Uyarı: {error}")
-            messagebox.showwarning("Premium gerekli", str(error))
+            self._notify(
+                "Premium indirme kullanılamıyor",
+                str(error),
+                tone="warning",
+                action_label="İndirme yöntemine dön",
+            )
             self._refresh_pipeline_buttons()
+            return
+        if _is_conversion_worker_failure(error):
+            self._set_status(
+                "Çeviri hazırlama geçici olarak durdu.",
+                "warning",
+                prominent=True,
+            )
+            self.progress_label.set("Kısa bir beklemeden sonra yeniden deneyin")
+            self._log(f"Worker hatası: {error}")
+            log_path = self._write_gui_error_log(error, traceback_text)
+            if log_path is not None:
+                self._log(f"Hata logu: {log_path}")
+            log_text = f"\n\nHata günlüğü:\n{log_path}" if log_path is not None else ""
+            self._notify(
+                "Çeviri hazırlama yeniden denenebilir",
+                (
+                    "Çeviri worker işlemi geçici olarak tamamlanamadı. Programı kapatmayın.\n\n"
+                    "Bu pencereyi kapattıktan sonra araç 12 saniyelik güvenli bir "
+                    "bekleme başlatacak. Sayaç bittiğinde Çeviriyi hazırla düğmesine "
+                    "yeniden basın.\n\n"
+                    "Gerekirse bu adımı birkaç kez tekrarlayabilirsiniz. Sorun iki veya "
+                    "üç denemeden sonra da sürerse hata günlüğünü paylaşın."
+                    f"{log_text}"
+                ),
+                tone="warning",
+                action_label="Bekleyip yeniden dene",
+            )
+            self._start_conversion_retry_cooldown()
             return
         self._set_status("Hata oluştu.", "danger", prominent=True)
         self.progress_label.set("İşlem hata verdi")
@@ -2586,12 +4107,21 @@ class ModlistTranslationInstallerApp:
             message = f"{error}\n\nHata logu:\n{log_path}"
         else:
             message = str(error)
-        messagebox.showerror("İşlem hatası", message)
+        self._notify(
+            "İşlem tamamlanamadı",
+            message,
+            tone="danger",
+            action_label="Detayları kapat",
+        )
         self._refresh_pipeline_buttons()
 
     def _run_task(self, label: str, work: Callable[[], Any], done: Callable[[Any], None]) -> None:
         if self.busy:
-            messagebox.showinfo("İşlem sürüyor", "Devam eden işlem tamamlanmalı.")
+            self._toast(
+                "İşlem hâlâ devam ediyor",
+                "Yeni bir adım başlatmadan önce devam eden işlemin tamamlanmasını bekleyin.",
+                tone="info",
+            )
             return
         self.busy = True
         self._set_status(label)
@@ -2609,6 +4139,21 @@ class ModlistTranslationInstallerApp:
 
         threading.Thread(target=runner, daemon=True).start()
 
+    def _run_auxiliary_task(
+        self,
+        queue_kind: str,
+        work: Callable[[], Any],
+        done: Callable[[Any], None],
+    ) -> None:
+        def runner() -> None:
+            try:
+                result = work()
+            except Exception as exc:  # noqa: BLE001 - callback receives safe error payload.
+                result = {"error": exc}
+            self.task_queue.put((queue_kind, (done, result)))
+
+        threading.Thread(target=runner, daemon=True).start()
+
     def _poll_task_queue(self) -> None:
         try:
             while True:
@@ -2618,6 +4163,23 @@ class ModlistTranslationInstallerApp:
                     continue
                 if kind == "eta":
                     self._handle_eta_event(payload)
+                    continue
+                if kind == "download_progress":
+                    self._handle_download_progress_event(payload)
+                    continue
+                if kind == "endorsement_progress":
+                    self._handle_endorsement_progress_event(payload)
+                    continue
+                if kind in {"endorsement_done", "api_usage_done"}:
+                    callback, result = payload  # type: ignore[misc]
+                    if kind == "endorsement_done":
+                        self.endorsement_busy = False
+                    else:
+                        self.api_usage_busy = False
+                    try:
+                        callback(result)
+                    except Exception as exc:  # noqa: BLE001 - keep GUI alive after auxiliary callbacks.
+                        self._log(f"Yardımcı işlem hatası: {exc}")
                     continue
                 self.busy = False
                 self._stop_busy_progress()
@@ -2642,7 +4204,7 @@ class ModlistTranslationInstallerApp:
             self.details_button.configure(text="Detayları göster")
             self.details_visible.set(False)
             return
-        self.details_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        self.details_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         self.details_button.configure(text="Detayları gizle")
         self.details_visible.set(True)
 
@@ -2668,6 +4230,8 @@ class ModlistTranslationInstallerApp:
     def _close(self) -> None:
         self._stop_time_estimate()
         self._stop_busy_progress()
+        self._stop_conversion_retry_cooldown()
+        self._cancel_endorsement_auto_retry()
         if hasattr(self, "scroll_canvas"):
             self.scroll_canvas.unbind_all("<MouseWheel>")
         self._stop_nxm_capture()
@@ -2866,20 +4430,145 @@ def _create_credential_store() -> CredentialStore:
         return MemoryCredentialStore()
 
 
-def main() -> None:
-    root = ctk.CTk()
-    try:
-        manifest = load_default_bundled_manifest(manifest_mode=MANIFEST_MODE_OTA)
-        source_info = default_manifest_source_info()
-    except Exception as exc:  # noqa: BLE001 - recovery UI keeps startup usable.
-        ManifestRecoveryApp(root, initial_error=exc)
-    else:
-        ModlistTranslationInstallerApp(
-            root,
-            initial_manifest=manifest,
-            initial_manifest_mode=MANIFEST_MODE_OTA,
-            initial_source_info=source_info,
+def _load_startup_manifest(
+    loader: Callable[..., dict[str, Any]] = load_default_bundled_manifest,
+    source_info_loader: Callable[[], dict[str, str | None]] = default_manifest_source_info,
+) -> tuple[dict[str, Any], dict[str, str | None]]:
+    manifest = loader(manifest_mode=MANIFEST_MODE_OTA)
+    return manifest, dict(source_info_loader())
+
+
+class StartupSplashApp:
+    """Show a responsive window while the OTA manifest is verified."""
+
+    _POLL_INTERVAL_MS = 50
+
+    def __init__(self, root: ctk.CTk) -> None:
+        self.root = root
+        self.result_queue: queue.Queue[
+            tuple[str, object, dict[str, str | None] | None]
+        ] = queue.Queue()
+        self.closed = False
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        self.root.title("Çeviri Aracı hazırlanıyor")
+        self.window_icon_photo: ImageTk.PhotoImage | None = None
+        startup_icon = _default_release_icon_path()
+        if startup_icon is not None:
+            self.window_icon_photo = _apply_window_icon_asset(self.root, startup_icon)
+        self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+
+        self.frame = ctk.CTkFrame(
+            self.root,
+            width=620,
+            height=260,
+            corner_radius=14,
+            fg_color="#17191f",
+            border_width=1,
+            border_color="#353944",
         )
+        self.frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+        self.frame.pack_propagate(False)
+
+        ctk.CTkLabel(
+            self.frame,
+            text="Çeviri Aracı hazırlanıyor",
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=25, weight="bold"),
+            text_color="#f3f4f6",
+        ).pack(fill=tk.X, padx=30, pady=(31, 8))
+        ctk.CTkLabel(
+            self.frame,
+            text=(
+                "Güncel çeviri listesi güvenli OTA kaynağından kontrol ediliyor.\n"
+                "İnternet bağlantısına göre bu işlem kısa bir süre alabilir."
+            ),
+            anchor="w",
+            justify=tk.LEFT,
+            font=ctk.CTkFont(family="Segoe UI", size=14),
+            text_color="#b8bdc7",
+        ).pack(fill=tk.X, padx=30, pady=(0, 22))
+        self.progress = ctk.CTkProgressBar(
+            self.frame,
+            mode="indeterminate",
+            height=9,
+            corner_radius=5,
+            fg_color="#292d35",
+            progress_color="#ff8a24",
+        )
+        self.progress.pack(fill=tk.X, padx=30)
+        self.progress.start()
+        self.status_text = tk.StringVar(value="Çeviri listesi doğrulanıyor...")
+        ctk.CTkLabel(
+            self.frame,
+            textvariable=self.status_text,
+            anchor="w",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color="#8f96a3",
+        ).pack(fill=tk.X, padx=30, pady=(12, 0))
+
+        self.root.update_idletasks()
+        width = 652
+        height = 292
+        x = max((self.root.winfo_screenwidth() - width) // 2, 0)
+        y = max((self.root.winfo_screenheight() - height) // 2, 0)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.deiconify()
+        self.root.lift()
+
+        threading.Thread(
+            target=self._load_manifest,
+            name="mtw-startup-manifest",
+            daemon=True,
+        ).start()
+        self.root.after(self._POLL_INTERVAL_MS, self._poll_result)
+
+    def _load_manifest(self) -> None:
+        try:
+            manifest, source_info = _load_startup_manifest()
+        except Exception as exc:  # noqa: BLE001 - recovery UI handles startup failures.
+            self.result_queue.put(("error", exc, None))
+        else:
+            self.result_queue.put(("ready", manifest, source_info))
+
+    def _poll_result(self) -> None:
+        if self.closed:
+            return
+        try:
+            kind, payload, source_info = self.result_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(self._POLL_INTERVAL_MS, self._poll_result)
+            return
+
+        self.progress.stop()
+        self.frame.destroy()
+        self.root.resizable(True, True)
+        if kind == "ready" and isinstance(payload, dict):
+            app: object = ModlistTranslationInstallerApp(
+                self.root,
+                initial_manifest=payload,
+                initial_manifest_mode=MANIFEST_MODE_OTA,
+                initial_source_info=source_info,
+            )
+        else:
+            error = payload if isinstance(payload, BaseException) else RuntimeError(
+                "OTA çeviri listesi yüklenemedi."
+            )
+            app = ManifestRecoveryApp(self.root, initial_error=error)
+        setattr(self.root, "_mtw_application", app)
+
+    def _close(self) -> None:
+        self.closed = True
+        self.progress.stop()
+        self.root.destroy()
+
+
+def main() -> None:
+    _configure_windows_app_identity()
+    root = ctk.CTk()
+    setattr(root, "_mtw_application", StartupSplashApp(root))
     root.mainloop()
 
 

@@ -7,8 +7,14 @@
 - Improved browser-assisted download error reporting and conversion coverage for active
   profile plugins.
 - Added c0kadam and Negatrm Discord support links to the installer.
-- Added a release-configured, user-initiated Nexus endorsement button.
+- Expanded the user-initiated Nexus endorsement action to support all unique translation
+  pages in the active manifest, with quota-aware retry reporting and reduced API usage.
+- Added a responsive startup window while the verified OTA manifest is downloaded.
+- Replaced classic Windows message boxes with themed decisions, readable result dialogs,
+  and non-blocking in-app guidance cards.
 - Updated the bundled LoreRim add-on package reference.
+- Isolated archive conversion in a dedicated GUI-free worker, added verified batch
+  extraction with per-member fallback, and improved native Windows crash diagnostics.
 
 ## 0.2.0 - 2026-07-18
 

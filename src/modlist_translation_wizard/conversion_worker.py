@@ -33,6 +33,14 @@ from modlist_translation_wizard.runtime import (
 
 _MAX_WORKER_ATTEMPTS = 2
 _WORKER_RETRY_DELAY_SECONDS = 0.75
+_DEDICATED_WORKER_EXE_NAME = "CeviriWorker.exe"
+_WINDOWS_NATIVE_FAILURES = {
+    0xC0000005: "STATUS_ACCESS_VIOLATION",
+    0xC0000017: "STATUS_NO_MEMORY",
+    0xC00000FD: "STATUS_STACK_OVERFLOW",
+    0xC0000374: "STATUS_HEAP_CORRUPTION",
+    0xC0000409: "STATUS_STACK_BUFFER_OVERRUN",
+}
 
 
 def run_conversion_in_worker(
@@ -211,7 +219,7 @@ def run_conversion_worker(config_path: Path | str) -> int:
 
 
 def _worker_command(config_path: Path) -> list[str]:
-    launcher = _standalone_launcher()
+    launcher = _standalone_worker_launcher()
     if launcher is not None:
         return [str(launcher), "--convert-worker", str(config_path)]
     return [
@@ -225,7 +233,7 @@ def _worker_command(config_path: Path) -> list[str]:
 
 
 def _plugin_worker_command() -> list[str]:
-    launcher = _standalone_launcher()
+    launcher = _standalone_worker_launcher()
     if launcher is not None:
         return [str(launcher), "--plugin-convert-worker"]
     return [
@@ -235,6 +243,17 @@ def _plugin_worker_command() -> list[str]:
         "modlist_translation_wizard",
         "--plugin-convert-worker",
     ]
+
+
+def _standalone_worker_launcher() -> Path | None:
+    launcher = _standalone_launcher()
+    if launcher is None:
+        return None
+
+    dedicated_worker = launcher.with_name(_DEDICATED_WORKER_EXE_NAME)
+    if dedicated_worker.is_file():
+        return dedicated_worker
+    return launcher
 
 
 def _standalone_launcher() -> Path | None:
@@ -336,6 +355,8 @@ def _preserve_worker_failure(
         stderr_path.unlink(missing_ok=True)
 
     diagnostics_path = worker_dir / "last_failed_worker.json"
+    progress = _read_status(progress_path)
+    native_failure = _windows_native_failure(completed.returncode)
     _write_json_atomic(
         diagnostics_path,
         {
@@ -344,6 +365,7 @@ def _preserve_worker_failure(
             "attempt": attempt,
             "max_attempts": _MAX_WORKER_ATTEMPTS,
             "returncode": completed.returncode,
+            "native_failure": native_failure,
             "retryable": _is_retryable_worker_failure(
                 completed=completed,
                 status=_read_status(status_path),
@@ -351,6 +373,7 @@ def _preserve_worker_failure(
             "status_snapshot": str(snapshots[0][1]) if snapshots[0][1].is_file() else None,
             "progress_snapshot": str(snapshots[1][1]) if snapshots[1][1].is_file() else None,
             "stderr_snapshot": str(stderr_path) if stderr_path.is_file() else None,
+            "last_progress": progress or None,
         },
     )
     return diagnostics_path
@@ -379,6 +402,15 @@ def _worker_failure_message(
         if archive_backend_diagnostic
         else ""
     )
+    progress = _read_status(progress_path)
+    progress_lines = _worker_progress_lines(progress)
+    native_failure = _windows_native_failure(completed.returncode)
+    native_failure_line = (
+        f"\nYerel Windows hatasi: {native_failure['hex_code']} "
+        f"{native_failure['name']}"
+        if native_failure is not None
+        else ""
+    )
     return (
         "Ceviri hazirlama islemi ayri worker process icinde basarisiz oldu.\n"
         f"Cikis kodu: {completed.returncode}\n"
@@ -388,7 +420,44 @@ def _worker_failure_message(
         f"Ilerleme dosyasi: {progress_path}\n"
         f"Korunan hata tanisi: {diagnostics_path}"
         f"{archive_backend_line}"
+        f"{native_failure_line}"
+        f"{progress_lines}"
     )
+
+
+def _windows_native_failure(returncode: int) -> dict[str, str] | None:
+    if os.name != "nt" or returncode == 0:
+        return None
+    unsigned_code = int(returncode) & 0xFFFFFFFF
+    name = _WINDOWS_NATIVE_FAILURES.get(unsigned_code)
+    if name is None:
+        return None
+    return {
+        "hex_code": f"0x{unsigned_code:08X}",
+        "name": name,
+    }
+
+
+def _worker_progress_lines(progress: dict[str, Any]) -> str:
+    if not progress:
+        return ""
+    stage = str(progress.get("converter_stage") or progress.get("stage") or "").strip()
+    lines = [f"Son asama: {stage}"] if stage else []
+    processed = progress.get("processed_archives")
+    total = progress.get("total_archives")
+    if processed is not None or total is not None:
+        lines.append(f"Arsiv ilerlemesi: {processed or 0}/{total or '?'}")
+    mod_id = progress.get("translation_nexus_mod_id")
+    file_id = progress.get("translation_file_id")
+    if mod_id is not None or file_id is not None:
+        lines.append(f"Nexus hedefi: {mod_id or '?'}/{file_id or '?'}")
+    archive_path = str(progress.get("archive_path") or "").strip()
+    if archive_path:
+        lines.append(f"Son arsiv: {archive_path}")
+    member_path = str(progress.get("member_path") or "").strip()
+    if member_path:
+        lines.append(f"Son dosya: {member_path}")
+    return "\n" + "\n".join(lines) if lines else ""
 
 
 def _write_status(path: Path, payload: dict[str, Any]) -> None:

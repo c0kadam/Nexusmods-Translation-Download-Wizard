@@ -12,6 +12,7 @@ from modlist_translation_wizard.nexus_auth import (
     auth_report_payload,
     clear_api_key,
     create_sso_handshake,
+    fetch_official_api_usage,
     load_api_key,
     require_premium_api_key,
     store_manual_api_key,
@@ -102,6 +103,28 @@ def test_require_premium_api_key_accepts_premium_or_unknown_status() -> None:
 
     assert premium.payload["is_premium"] is True
     assert unknown.payload["name"] == "LegacyResponse"
+
+
+def test_fetch_official_api_usage_returns_response_header_counters() -> None:
+    from modlist_translate_tool.nexus.api_client import NexusApiResponse, NexusRateLimit
+
+    expected = NexusRateLimit(
+        hourly_remaining=1980,
+        hourly_limit=2000,
+        daily_remaining=19900,
+        daily_limit=20000,
+    )
+
+    class Client:
+        def validate(self) -> NexusApiResponse:
+            return NexusApiResponse(payload={"is_premium": True}, rate_limit=expected)
+
+    actual = fetch_official_api_usage(
+        "API_KEY",
+        client_factory=lambda _key: Client(),
+    )
+
+    assert actual == expected
 
 
 def test_premium_plan_can_use_temporary_api_key_without_leaking_secret(tmp_path, monkeypatch) -> None:

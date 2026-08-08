@@ -2,9 +2,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-.codex/
-.agents/
-memory-bank/
 build/
 dist/
 release/

@@ -23,6 +23,7 @@ from modlist_translation_wizard.runtime import (
     build_wizard_preflight,
     convert_downloaded_translations_from_manifest,
     download_queue_readiness,
+    plan_downloads_from_manifest,
     plan_premium_downloads_from_manifest,
 )
 
@@ -442,6 +443,36 @@ def test_premium_plan_uses_manifest_download_cache_roots(tmp_path) -> None:
     assert "archive_already_present_for_nexus_file_identity" in item["warnings"]
 
 
+def test_download_plan_can_ignore_manifest_download_cache_roots(tmp_path) -> None:
+    profile = _profile()
+    manifest = _manifest(profile=profile)
+    shared_cache = tmp_path / "shared-cache"
+    manifest["resources"] = {
+        "download_cache_roots": [
+            {"type": "manifest_relative", "path": shared_cache.name}
+        ]
+    }
+    archive_dir = shared_cache / "nexusmods" / "skyrimspecialedition" / "333" / "444"
+    archive_dir.mkdir(parents=True)
+    (archive_dir / "existing-translation.7z").write_bytes(b"archive")
+    manifest_result = write_wizard_manifest(manifest, tmp_path / "wizard.json")
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    result = plan_downloads_from_manifest(
+        manifest_path=manifest_result.manifest_path,
+        profile_scan_path=profile_path,
+        download_dir=tmp_path / "downloads",
+        out_dir=tmp_path / "out",
+        delivery_mode="PREMIUM_API",
+        use_manifest_download_cache_roots=False,
+    )
+
+    item = result.download_plan.queue_payload["items"][0]
+    assert item["status"] == "PLANNED"
+    assert str(shared_cache) not in item["local_archive_path"]
+
+
 def test_premium_plan_skips_artifacts_satisfied_by_local_dsd_source(tmp_path) -> None:
     profile = _profile()
     manifest = _manifest(profile=profile)
@@ -620,6 +651,41 @@ def test_premium_plan_refuses_unresolved_profile_targets(tmp_path) -> None:
             download_dir=tmp_path / "downloads",
             out_dir=tmp_path / "out",
         )
+
+
+def test_premium_plan_includes_manifest_downloads_when_profile_drift_is_allowed(
+    tmp_path,
+) -> None:
+    manifest = _manifest()
+    manifest_result = write_wizard_manifest(manifest, tmp_path / "wizard.json")
+    profile = _profile()
+    profile["active_plugins"] = []
+    profile["mods"] = []
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+
+    result = plan_premium_downloads_from_manifest(
+        manifest_path=manifest_result.manifest_path,
+        profile_scan_path=profile_path,
+        download_dir=tmp_path / "downloads",
+        out_dir=tmp_path / "out",
+        allow_profile_drift=True,
+    )
+
+    assert result.preflight_payload["status"] == "REVIEW_REQUIRED"
+    assert result.preflight_payload["summary"]["missing_entries"] == 1
+    decisions = json.loads(result.decisions_path.read_text(encoding="utf-8"))
+    assert decisions["summary"]["target_count"] == 1
+    assert decisions["summary"]["decision_count"] == 2
+    queue = result.download_plan.queue_payload
+    assert queue["summary"]["item_count"] == 2
+    assert [item["request"]["translation_file_id"] for item in queue["items"]] == [
+        444,
+        445,
+    ]
+    readiness = download_queue_readiness(manifest, queue)
+    assert readiness["required_count"] == 2
+    assert readiness["missing_count"] == 2
 
 
 def test_download_readiness_requires_every_curated_archive_on_disk(tmp_path) -> None:

@@ -236,6 +236,7 @@ def plan_downloads_from_manifest(
     auth_env_var: str = "NEXUS_API_KEY",
     api_key: str | None = None,
     allow_profile_drift: bool = False,
+    use_manifest_download_cache_roots: bool = True,
 ) -> WizardPremiumPlanResult:
     manifest_file = Path(manifest_path)
     manifest = load_wizard_manifest(manifest_file)
@@ -249,7 +250,14 @@ def plan_downloads_from_manifest(
         raise WizardManifestError(
             "wizard profile preflight is not READY; refusing download planning"
         )
-    matched_ids = set(preflight["matched_target_ids"])
+    if preflight["status"] != "READY" and allow_profile_drift:
+        matched_ids = {
+            str(entry.get("target_id"))
+            for entry in manifest.get("entries", [])
+            if isinstance(entry, dict) and str(entry.get("target_id") or "").strip()
+        }
+    else:
+        matched_ids = set(preflight["matched_target_ids"])
     locally_satisfied_sources = _manifest_locally_satisfied_artifact_sources(manifest)
     decisions_payload = _manifest_decisions(
         manifest,
@@ -257,7 +265,11 @@ def plan_downloads_from_manifest(
         profile=profile,
         locally_satisfied_artifact_sources=locally_satisfied_sources,
     )
-    download_cache_roots = _manifest_download_cache_roots(manifest, manifest_file)
+    download_cache_roots = (
+        _manifest_download_cache_roots(manifest, manifest_file)
+        if use_manifest_download_cache_roots
+        else []
+    )
     output_dir = Path(out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     preflight_path = output_dir / "wizard_preflight.json"
@@ -442,6 +454,7 @@ def convert_downloaded_translations_from_manifest(
         output_mod_path=Path(conversion.output_mod_path),
         staging_root=stage_root,
         out_dir=output_dir,
+        progress_status_path=progress_status_path,
     )
     _write_conversion_progress(progress_status_path, "applying_native_binary_assets")
     binary_payload = _apply_native_binary_assets(
@@ -451,6 +464,7 @@ def convert_downloaded_translations_from_manifest(
         out_dir=output_dir,
         seven_zip_path=resolved_seven_zip_path,
         overwrite=overwrite,
+        progress_status_path=progress_status_path,
     )
     add_on_summary = add_on_payload.get("summary", {})
     binary_summary = binary_payload.get("summary", {})
@@ -491,7 +505,11 @@ def convert_downloaded_translations_from_manifest(
     )
 
 
-def _write_conversion_progress(path: Path | str | None, stage: str) -> None:
+def _write_conversion_progress(
+    path: Path | str | None,
+    stage: str,
+    **details: object,
+) -> None:
     if path is None:
         return
     status_path = Path(path)
@@ -504,6 +522,7 @@ def _write_conversion_progress(path: Path | str | None, stage: str) -> None:
                 "ok": False,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "stage": stage,
+                **details,
             },
         )
     except OSError:
@@ -875,15 +894,26 @@ def _apply_add_on_packages(
     output_mod_path: Path,
     staging_root: Path,
     out_dir: Path,
+    progress_status_path: Path | str | None = None,
 ) -> dict[str, Any]:
     packages = _manifest_add_on_packages(manifest)
     items: list[dict[str, Any]] = []
-    for package in packages:
+    for position, package in enumerate(packages, start=1):
         archive_path = _queue_archive_for_identity(
             queue_payload,
             _add_on_package_identity(package),
         )
         public_package = _add_on_package_public_payload(package)
+        _write_conversion_progress(
+            progress_status_path,
+            "extracting_add_on_package",
+            processed_packages=position,
+            total_packages=len(packages),
+            translation_nexus_mod_id=package.get("translation_nexus_mod_id"),
+            translation_file_id=package.get("translation_file_id"),
+            archive_path=str(archive_path) if archive_path is not None else "",
+            display_name=package.get("display_name") or package.get("id"),
+        )
         if archive_path is None:
             status = "FAILED" if package.get("required", True) else "SKIPPED_MISSING"
             items.append(
@@ -978,6 +1008,7 @@ def _apply_native_binary_assets(
     out_dir: Path,
     seven_zip_path: Path | None,
     overwrite: bool,
+    progress_status_path: Path | str | None = None,
 ) -> dict[str, Any]:
     assets = _manifest_native_binary_assets(manifest)
     previous_state = _read_native_binary_state(output_mod_path)
@@ -989,11 +1020,21 @@ def _apply_native_binary_assets(
     )
     items: list[dict[str, Any]] = []
     installed_state: list[dict[str, Any]] = []
-    for asset in assets:
+    for position, asset in enumerate(assets, start=1):
         public_asset = _native_binary_asset_public_payload(asset)
         archive_path = _queue_archive_for_identity(
             queue_payload,
             _native_binary_asset_identity(asset),
+        )
+        _write_conversion_progress(
+            progress_status_path,
+            "extracting_native_binary_asset",
+            processed_assets=position,
+            total_assets=len(assets),
+            translation_nexus_mod_id=asset.get("translation_nexus_mod_id"),
+            translation_file_id=asset.get("translation_file_id"),
+            archive_path=str(archive_path) if archive_path is not None else "",
+            display_name=asset.get("display_name") or asset.get("id"),
         )
         if archive_path is None:
             status = "FAILED" if asset.get("required", True) else "SKIPPED_MISSING"

@@ -142,6 +142,22 @@ def failed_non_premium_downloads(
     return failed
 
 
+def unavailable_non_premium_downloads(
+    queue_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Return every required queue item that still needs user action."""
+    unavailable: list[dict[str, Any]] = []
+    for item in queue_payload.get("items", []):
+        if not isinstance(item, dict) or _queue_item_is_available(item):
+            continue
+        summary = _queue_item_download_summary(item)
+        if summary is None:
+            continue
+        summary["last_error"] = str(item.get("last_error") or "")
+        unavailable.append(summary)
+    return unavailable
+
+
 def run_non_premium_nxm_download(
     *,
     plan: WizardPremiumPlanResult,
